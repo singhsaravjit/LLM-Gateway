@@ -1,0 +1,11 @@
+# Fill in GitHub usernames once teammates accept the invite, e.g.:
+# /internal/cache/       @dinesh-username
+# /internal/ratelimit/   @saravjit-username
+# /internal/budget/      @saravjit-username
+# /internal/queue/       @saravjit-username
+# /internal/router/      @preshit-username
+# /internal/provider/    @preshit-username
+# /cmd/gateway/          @preshit-username
+# /cmd/mockllm/          @kanad-username
+# /deploy/               @kanad-username
+# /loadtest/             @kanad-username

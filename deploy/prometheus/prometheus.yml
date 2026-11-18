@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: gateway
+    dns_sd_configs:              # discovers every gateway replica in compose
+      - names: [gateway]
+        type: A
+        port: 8080
