@@ -1,0 +1,26 @@
+# Go
+/bin/
+*.exe
+*.test
+*.out
+coverage.*
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.lock.hcl
+crash.log
+
+# Python / Locust
+__pycache__/
+.venv/
+*.pyc
+
+# Secrets & local
+.env
+*.pem
+.DS_Store
+.idea/
+.vscode/
