@@ -28,6 +28,7 @@ Error body: `{"error": {"type": "...", "message": "..."}}`
 | 429    | `rate_limited`    | per-key limit hit (has `Retry-After`)     |
 | 502    | `upstream_error`  | provider failed after retries/fallback    |
 | 503    | `queue_full`      | backpressure: overflow queue is full      |
+| 503    | `limiter_unavailable` | Redis down and `RATELIMIT_FAIL_MODE=closed` (has `Retry-After`) |
 | 504    | `queue_timeout`   | waited in the queue longer than `QUEUE_WAIT_TIMEOUT_MS` |
 
 Other endpoints: `GET /healthz`, `GET /metrics` (Prometheus).
@@ -38,7 +39,7 @@ Other endpoints: `GET /healthz`, `GET /metrics` (Prometheus).
 |-----------------------------------|--------|----------|----------------------------------------|
 | `cache:<sha256(model,messages)>`  | string | Dinesh   | JSON `ChatResponse`, TTL = cache TTL   |
 | `lock:<cache-key>`                | string | Dinesh   | coalescing lock, short TTL             |
-| `rl:<api-key>`                    | hash   | Saravjit | token bucket `{tokens, ts}`            |
+| `rl:<api-key>`                    | hash   | Saravjit | token bucket `{tokens, ts}`; `ts` is Redis server time (s); auto-expires when full |
 | `rl:provider:<model>`             | hash   | Saravjit | shared provider-side token bucket      |
 | `budget:<team>:<yyyy-mm>`         | string | Saravjit | integer **micro-USD** spent (`INCRBY`), UTC month |
 | `queue:provider`                  | stream | Saravjit | overflow jobs, consumer group `workers` |
@@ -56,5 +57,6 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 ## Environment variables (gateway)
 
 `PORT`, `PROVIDER_URL`, `PROVIDER_API_KEY`, `PROVIDER_TIMEOUT_MS`, `REDIS_ADDR`,
-`RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `TEAM_BUDGET_USD`, `CACHE_TTL_SECONDS`,
+`RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `RATELIMIT_BACKEND` (`local`|`redis`, default `redis` when `REDIS_ADDR` is set),
+`RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD`, `CACHE_TTL_SECONDS`,
 `ROUTER_MAX_CHEAP_CHARS`.

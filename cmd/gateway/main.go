@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,6 +25,8 @@ import (
 	"github.com/singhsaravjit/llm-gateway/internal/provider"
 	"github.com/singhsaravjit/llm-gateway/internal/ratelimit"
 	"github.com/singhsaravjit/llm-gateway/internal/router"
+
+	"github.com/redis/go-redis/v9"
 )
 
 type server struct {
@@ -39,8 +42,13 @@ type server struct {
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	limiter, err := newLimiter(log)
+	if err != nil {
+		log.Error("rate limiter config", "err", err)
+		os.Exit(1)
+	}
 	s := &server{
-		limiter:  ratelimit.NewLocal(envInt("RATE_LIMIT_PER_MIN", 100), envInt("RATE_LIMIT_BURST", 20)),
+		limiter:  limiter,
 		budget:   budget.NewMemory(envFloat("TEAM_BUDGET_USD", 0)),
 		cache:    cache.NewMemory(),
 		cacheTTL: time.Duration(envInt("CACHE_TTL_SECONDS", 300)) * time.Second,
@@ -90,8 +98,19 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 1. Rate limit
-	if d, err := s.limiter.Allow(ctx, key); err == nil && !d.Allowed {
+	// 1. Rate limit. On a limiter (Redis) error the decision already reflects
+	// the configured fail mode; we count the error and act on the decision.
+	d, err := s.limiter.Allow(ctx, key)
+	if err != nil {
+		s.metrics.Inc("ratelimit_errors_total", 1)
+		s.log.Warn("rate limiter error", "request_id", reqID, "err", err, "allowed", d.Allowed)
+		if !d.Allowed { // fail closed
+			s.metrics.Inc(`requests_total{result="limiter_unavailable"}`, 1)
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, "limiter_unavailable", "rate limiter unavailable")
+			return
+		}
+	} else if !d.Allowed {
 		s.metrics.Inc(`requests_total{result="rate_limited"}`, 1)
 		w.Header().Set("Retry-After", strconv.Itoa(int(d.RetryAfter.Seconds())+1))
 		writeErr(w, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded")
@@ -150,6 +169,44 @@ func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheSta
 	// One structured log line per request (schema: docs/api.md).
 	s.log.Info("request", "request_id", reqID, "api_key", mask(key), "team", team, "model", model,
 		"cache", cacheStatus, "tokens", resp.Usage.TotalTokens, "cost_usd", cost, "latency_ms", lat.Milliseconds())
+}
+
+// newLimiter picks the rate limiter from config:
+//
+//	RATELIMIT_BACKEND   local | redis (default: redis if REDIS_ADDR is set, else local)
+//	RATELIMIT_FAIL_MODE open | closed  — behaviour when Redis is unreachable
+//	RATELIMIT_REDIS_TIMEOUT_MS         — per-call budget before failing open/closed
+func newLimiter(log *slog.Logger) (ratelimit.Limiter, error) {
+	perMin, burst := envInt("RATE_LIMIT_PER_MIN", 100), envInt("RATE_LIMIT_BURST", 20)
+	addr := os.Getenv("REDIS_ADDR")
+	backend := os.Getenv("RATELIMIT_BACKEND")
+	if backend == "" {
+		backend = "local"
+		if addr != "" {
+			backend = "redis"
+		}
+	}
+	switch backend {
+	case "local":
+		log.Info("rate limiter", "backend", "local", "per_min", perMin, "burst", burst)
+		return ratelimit.NewLocal(perMin, burst), nil
+	case "redis":
+		if addr == "" {
+			return nil, errors.New("RATELIMIT_BACKEND=redis requires REDIS_ADDR")
+		}
+		mode, err := ratelimit.ParseFailMode(os.Getenv("RATELIMIT_FAIL_MODE"))
+		if err != nil {
+			return nil, err
+		}
+		// TODO: use the shared client from internal/redisx once #29 lands.
+		client := redis.NewClient(&redis.Options{Addr: addr})
+		timeout := time.Duration(envInt("RATELIMIT_REDIS_TIMEOUT_MS", 50)) * time.Millisecond
+		log.Info("rate limiter", "backend", "redis", "addr", addr, "per_min", perMin, "burst", burst,
+			"fail_mode", os.Getenv("RATELIMIT_FAIL_MODE"), "timeout", timeout.String())
+		return ratelimit.NewRedis(client, perMin, burst,
+			ratelimit.WithFailMode(mode), ratelimit.WithTimeout(timeout)), nil
+	}
+	return nil, fmt.Errorf("unknown RATELIMIT_BACKEND %q (want local|redis)", backend)
 }
 
 func writeErr(w http.ResponseWriter, code int, typ, msg string) {
