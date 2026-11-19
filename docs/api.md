@@ -29,6 +29,7 @@ Error body: `{"error": {"type": "...", "message": "..."}}`
 | 502    | `upstream_error`  | provider failed after retries/fallback    |
 | 503    | `queue_full`      | backpressure: overflow queue is full      |
 | 503    | `limiter_unavailable` | Redis down and `RATELIMIT_FAIL_MODE=closed` (has `Retry-After`) |
+| 504    | `queue_timeout`   | waited in the queue longer than `QUEUE_WAIT_TIMEOUT_MS` |
 
 Other endpoints: `GET /healthz`, `GET /metrics` (Prometheus).
 
@@ -39,8 +40,12 @@ Other endpoints: `GET /healthz`, `GET /metrics` (Prometheus).
 | `cache:<sha256(model,messages)>`  | string | Dinesh   | JSON `ChatResponse`, TTL = cache TTL   |
 | `lock:<cache-key>`                | string | Dinesh   | coalescing lock, short TTL             |
 | `rl:<api-key>`                    | hash   | Saravjit | token bucket `{tokens, ts}`; `ts` is Redis server time (s); auto-expires when full |
-| `budget:<team>:<yyyy-mm>`         | string | Saravjit | `INCRBYFLOAT` USD spent                |
-| `queue:provider`                  | stream | Saravjit | if Redis Streams chosen over SQS       |
+| `rl:provider:<model>`             | hash   | Saravjit | shared provider-side token bucket      |
+| `budget:<team>:<yyyy-mm>`         | string | Saravjit | integer **micro-USD** spent (`INCRBY`), UTC month |
+| `queue:provider`                  | stream | Saravjit | overflow jobs, consumer group `workers` |
+| `reply:<node-id>`                 | stream | Saravjit | results for requests waiting on that node |
+
+Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budgets.md).
 
 ## Structured log line (one per request)
 
