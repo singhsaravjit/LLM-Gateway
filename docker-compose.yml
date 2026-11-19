@@ -9,6 +9,7 @@ services:
       PROVIDER_URL: http://mockllm:9000
       REDIS_ADDR: redis:6379
       RATE_LIMIT_PER_MIN: "100"
+      RATELIMIT_FAIL_MODE: open        # open | closed (Experiment 4)
       CACHE_TTL_SECONDS: "300"
     depends_on: [mockllm, redis]
     deploy: { replicas: 1 }   # scale with: docker compose up --scale gateway=3 (remove ports mapping first)
