@@ -60,3 +60,7 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 `RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `RATELIMIT_BACKEND` (`local`|`redis`, default `redis` when `REDIS_ADDR` is set),
 `RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD`, `CACHE_TTL_SECONDS`,
 `ROUTER_MAX_CHEAP_CHARS`.
+
+Shared Redis client (`internal/redisx`, one pool for all components; unset means go-redis default):
+`REDIS_POOL_SIZE` (default 10 per CPU), `REDIS_DIAL_TIMEOUT_MS` (5000), `REDIS_READ_TIMEOUT_MS` (3000),
+`REDIS_WRITE_TIMEOUT_MS` (same as read). Per-call context timeouts (e.g. `RATELIMIT_REDIS_TIMEOUT_MS`) are honoured.
