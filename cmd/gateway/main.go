@@ -55,10 +55,15 @@ func main() {
 		log.Error("rate limiter config", "err", err)
 		os.Exit(1)
 	}
+	respCache, err := newCache(log, rdb)
+	if err != nil {
+		log.Error("cache config", "err", err)
+		os.Exit(1)
+	}
 	s := &server{
 		limiter:  limiter,
 		budget:   budget.NewMemory(envFloat("TEAM_BUDGET_USD", 0)),
-		cache:    cache.NewMemory(),
+		cache:    respCache,
 		cacheTTL: time.Duration(envInt("CACHE_TTL_SECONDS", 300)) * time.Second,
 		router:   router.LengthRouter{MaxCheapChars: envInt("ROUTER_MAX_CHEAP_CHARS", 500)},
 		provider: provider.NewHTTP(env("PROVIDER_URL", "http://localhost:9000"), os.Getenv("PROVIDER_API_KEY"),
@@ -135,7 +140,14 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	ckey := cache.Key(model, req.Messages)
 	cacheStatus := "BYPASS"
 	if !req.NoCache {
-		if resp, hit, _ := s.cache.Get(ctx, ckey); hit {
+		// A cache error (Redis slow/down) is counted and treated as a miss:
+		// the cache never fails a request.
+		resp, hit, err := s.cache.Get(ctx, ckey)
+		if err != nil {
+			s.metrics.Inc(`cache_errors_total{op="get"}`, 1)
+			s.log.Warn("cache get error", "request_id", reqID, "err", err)
+		}
+		if hit {
 			s.finish(w, reqID, key, team, model, "HIT", resp, 0, start)
 			return
 		}
@@ -158,7 +170,10 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	cost := provider.Cost(model, resp.Usage)
 	_ = s.budget.Add(ctx, team, cost)
 	if !req.NoCache {
-		_ = s.cache.Set(ctx, ckey, resp, s.cacheTTL)
+		if err := s.cache.Set(ctx, ckey, resp, s.cacheTTL); err != nil {
+			s.metrics.Inc(`cache_errors_total{op="set"}`, 1)
+			s.log.Warn("cache set error", "request_id", reqID, "err", err)
+		}
 	}
 	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, start)
 }
@@ -212,6 +227,33 @@ func newLimiter(log *slog.Logger, client *redis.Client) (ratelimit.Limiter, erro
 			ratelimit.WithFailMode(mode), ratelimit.WithTimeout(timeout)), nil
 	}
 	return nil, fmt.Errorf("unknown RATELIMIT_BACKEND %q (want local|redis)", backend)
+}
+
+// newCache picks the response cache from config:
+//
+//	CACHE_BACKEND          memory | redis (default: redis if REDIS_ADDR is set, else memory)
+//	CACHE_REDIS_TIMEOUT_MS per-call budget before a lookup counts as a miss (default 50)
+func newCache(log *slog.Logger, client *redis.Client) (cache.Cache, error) {
+	backend := os.Getenv("CACHE_BACKEND")
+	if backend == "" {
+		backend = "memory"
+		if client != nil {
+			backend = "redis"
+		}
+	}
+	switch backend {
+	case "memory":
+		log.Info("cache", "backend", "memory")
+		return cache.NewMemory(), nil
+	case "redis":
+		if client == nil {
+			return nil, errors.New("CACHE_BACKEND=redis requires REDIS_ADDR")
+		}
+		timeout := time.Duration(envInt("CACHE_REDIS_TIMEOUT_MS", 50)) * time.Millisecond
+		log.Info("cache", "backend", "redis", "addr", client.Options().Addr, "timeout", timeout.String())
+		return cache.NewRedis(client, cache.WithTimeout(timeout)), nil
+	}
+	return nil, fmt.Errorf("unknown CACHE_BACKEND %q (want memory|redis)", backend)
 }
 
 // newRedis builds the shared Redis client from REDIS_* env vars (see
