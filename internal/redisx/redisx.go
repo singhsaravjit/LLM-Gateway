@@ -3,6 +3,19 @@
 // Builds the one go-redis client the gateway shares between the cache, rate
 // limiter, budgets and queue, so every component uses the same connection pool
 // and timeout settings.
+//
+// In the gateway (cmd/gateway builds it once and passes it around):
+//
+//	client, err := redisx.FromEnv() // nil, nil when REDIS_ADDR is unset
+//	if client != nil {
+//		limiter = ratelimit.NewRedis(client, perMin, burst)
+//	}
+//
+// Components take a client and set a short per-call timeout with
+// context.WithTimeout; the client honours it (see New).
+//
+// In tests, use the redistest subpackage: redistest.Start(t) for a miniredis
+// plus client, redistest.NewFaultProxy to make Redis slow or down.
 package redisx
 
 import (
