@@ -59,7 +59,11 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 `PORT`, `PROVIDER_URL`, `PROVIDER_API_KEY`, `PROVIDER_TIMEOUT_MS`, `REDIS_ADDR`,
 `RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `RATELIMIT_BACKEND` (`local`|`redis`, default `redis` when `REDIS_ADDR` is set),
 `RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD`, `CACHE_TTL_SECONDS`,
+`CACHE_BACKEND` (`memory`|`redis`, default `redis` when `REDIS_ADDR` is set), `CACHE_REDIS_TIMEOUT_MS` (default 50; a slower lookup counts as a miss),
 `ROUTER_MAX_CHEAP_CHARS`.
+
+The cache fails open: if Redis is slow or down, the request is served as a `MISS` from the provider and
+`llmgw_cache_errors_total{op="get"|"set"}` is incremented.
 
 Shared Redis client (`internal/redisx`, one pool for all components; unset means go-redis default):
 `REDIS_POOL_SIZE` (default 10 per CPU), `REDIS_DIAL_TIMEOUT_MS` (5000), `REDIS_READ_TIMEOUT_MS` (3000),

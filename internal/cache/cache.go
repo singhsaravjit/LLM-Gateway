@@ -1,9 +1,10 @@
 // Package cache — owner: Dinesh.
 //
 // Shared response cache keyed on a hash of (model, prompt). Redis-backed in
-// production; the in-memory implementation exists for local dev and tests.
-// TODO(dinesh): Redis implementation, TTL config, request coalescing
-// (singleflight across nodes), semantic cache (stretch).
+// production (redis.go); the in-memory implementation exists for local dev and
+// tests.
+// TODO(dinesh): request coalescing (docs/design/cache-coalescing.md),
+// semantic cache (stretch).
 package cache
 
 import (
@@ -22,7 +23,10 @@ type Cache interface {
 	Set(ctx context.Context, key string, resp *api.ChatResponse, ttl time.Duration) error
 }
 
-// Key builds the cache key. Format is fixed in docs/redis-keys.md: cache:<sha256>.
+// Key builds the cache key. Format is fixed in docs/api.md: cache:<sha256>.
+// TODO(dinesh): include max_tokens, so a reply cut short at a small limit is
+// not served to a request with a larger one. Changes the key format, so it
+// goes in its own PR reviewed by all owners.
 func Key(model string, msgs []api.Message) string {
 	b, _ := json.Marshal(struct {
 		M string        `json:"m"`
