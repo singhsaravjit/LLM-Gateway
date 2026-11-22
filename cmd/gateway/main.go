@@ -6,6 +6,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,7 @@ import (
 	"github.com/singhsaravjit/llm-gateway/internal/metrics"
 	"github.com/singhsaravjit/llm-gateway/internal/provider"
 	"github.com/singhsaravjit/llm-gateway/internal/ratelimit"
+	"github.com/singhsaravjit/llm-gateway/internal/redisx"
 	"github.com/singhsaravjit/llm-gateway/internal/router"
 
 	"github.com/redis/go-redis/v9"
@@ -42,7 +44,13 @@ type server struct {
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	limiter, err := newLimiter(log)
+	// One Redis client shared by every Redis-backed component (nil without REDIS_ADDR).
+	rdb, err := newRedis(log)
+	if err != nil {
+		log.Error("redis config", "err", err)
+		os.Exit(1)
+	}
+	limiter, err := newLimiter(log, rdb)
 	if err != nil {
 		log.Error("rate limiter config", "err", err)
 		os.Exit(1)
@@ -176,13 +184,12 @@ func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheSta
 //	RATELIMIT_BACKEND   local | redis (default: redis if REDIS_ADDR is set, else local)
 //	RATELIMIT_FAIL_MODE open | closed  — behaviour when Redis is unreachable
 //	RATELIMIT_REDIS_TIMEOUT_MS         — per-call budget before failing open/closed
-func newLimiter(log *slog.Logger) (ratelimit.Limiter, error) {
+func newLimiter(log *slog.Logger, client *redis.Client) (ratelimit.Limiter, error) {
 	perMin, burst := envInt("RATE_LIMIT_PER_MIN", 100), envInt("RATE_LIMIT_BURST", 20)
-	addr := os.Getenv("REDIS_ADDR")
 	backend := os.Getenv("RATELIMIT_BACKEND")
 	if backend == "" {
 		backend = "local"
-		if addr != "" {
+		if client != nil {
 			backend = "redis"
 		}
 	}
@@ -191,22 +198,37 @@ func newLimiter(log *slog.Logger) (ratelimit.Limiter, error) {
 		log.Info("rate limiter", "backend", "local", "per_min", perMin, "burst", burst)
 		return ratelimit.NewLocal(perMin, burst), nil
 	case "redis":
-		if addr == "" {
+		if client == nil {
 			return nil, errors.New("RATELIMIT_BACKEND=redis requires REDIS_ADDR")
 		}
 		mode, err := ratelimit.ParseFailMode(os.Getenv("RATELIMIT_FAIL_MODE"))
 		if err != nil {
 			return nil, err
 		}
-		// TODO: use the shared client from internal/redisx once #29 lands.
-		client := redis.NewClient(&redis.Options{Addr: addr})
 		timeout := time.Duration(envInt("RATELIMIT_REDIS_TIMEOUT_MS", 50)) * time.Millisecond
-		log.Info("rate limiter", "backend", "redis", "addr", addr, "per_min", perMin, "burst", burst,
+		log.Info("rate limiter", "backend", "redis", "addr", client.Options().Addr, "per_min", perMin, "burst", burst,
 			"fail_mode", os.Getenv("RATELIMIT_FAIL_MODE"), "timeout", timeout.String())
 		return ratelimit.NewRedis(client, perMin, burst,
 			ratelimit.WithFailMode(mode), ratelimit.WithTimeout(timeout)), nil
 	}
 	return nil, fmt.Errorf("unknown RATELIMIT_BACKEND %q (want local|redis)", backend)
+}
+
+// newRedis builds the shared Redis client from REDIS_* env vars (see
+// internal/redisx). It returns nil when REDIS_ADDR is unset. An unreachable
+// Redis is only a warning: each component has its own failure mode.
+func newRedis(log *slog.Logger) (*redis.Client, error) {
+	client, err := redisx.FromEnv()
+	if err != nil || client == nil {
+		return nil, err
+	}
+	o := client.Options()
+	if err := redisx.Ping(context.Background(), client, time.Second); err != nil {
+		log.Warn("redis unreachable at startup", "addr", o.Addr, "err", err)
+	} else {
+		log.Info("redis connected", "addr", o.Addr, "pool_size", o.PoolSize)
+	}
+	return client, nil
 }
 
 func writeErr(w http.ResponseWriter, code int, typ, msg string) {
