@@ -9,14 +9,14 @@ import (
 
 	"github.com/alicebob/miniredis/v2"
 	"github.com/redis/go-redis/v9"
+
+	"github.com/singhsaravjit/llm-gateway/internal/redisx/redistest"
 )
 
 func newTestRedis(t *testing.T) (*miniredis.Miniredis, *redis.Client) {
 	t.Helper()
-	mr := miniredis.RunT(t)
+	mr, c := redistest.Start(t)
 	mr.SetTime(time.Unix(1_700_000_000, 0))
-	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
-	t.Cleanup(func() { c.Close() })
 	return mr, c
 }
 
