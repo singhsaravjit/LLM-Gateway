@@ -60,7 +60,10 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 `RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `RATELIMIT_BACKEND` (`local`|`redis`, default `redis` when `REDIS_ADDR` is set),
 `RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD`, `CACHE_TTL_SECONDS`,
 `CACHE_BACKEND` (`memory`|`redis`, default `redis` when `REDIS_ADDR` is set), `CACHE_REDIS_TIMEOUT_MS` (default 50; a slower lookup counts as a miss),
-`ROUTER_MAX_CHEAP_CHARS`.
+`ROUTER_MAX_CHEAP_CHARS`,
+`QUEUE_ENABLED` (default `true`), `QUEUE_BACKEND` (`memory`|`redis`), `QUEUE_MAX` (1000), `QUEUE_WAIT_TIMEOUT_MS` (30000),
+`QUEUE_WORKERS` (8 per node), `QUEUE_VISIBILITY_TIMEOUT_MS` (wait + 30s), `PROVIDER_RPS` (45; 0 = no pacing),
+`PROVIDER_BURST`, `PROVIDER_RPS_PER_MODEL` (`false`), `NODE_ID`.
 
 The cache fails open: if Redis is slow or down, the request is served as a `MISS` from the provider and
 `llmgw_cache_errors_total{op="get"|"set"}` is incremented.
