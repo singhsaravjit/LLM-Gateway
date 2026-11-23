@@ -24,11 +24,12 @@ Error body: `{"error": {"type": "...", "message": "..."}}`
 |--------|-------------------|-------------------------------------------|
 | 400    | `bad_request`     | invalid body                              |
 | 401    | `bad_request`     | missing API key                           |
-| 402    | `budget_exceeded` | team over budget                          |
+| 402    | `budget_exceeded` | team over its monthly budget (cache hits are still served) |
 | 429    | `rate_limited`    | per-key limit hit (has `Retry-After`)     |
 | 502    | `upstream_error`  | provider failed after retries/fallback    |
 | 503    | `queue_full`      | backpressure: overflow queue is full      |
 | 503    | `limiter_unavailable` | Redis down and `RATELIMIT_FAIL_MODE=closed` (has `Retry-After`) |
+| 503    | `budget_unavailable` | Redis down and `BUDGET_FAIL_MODE=closed` (has `Retry-After`) |
 | 504    | `queue_timeout`   | waited in the queue longer than `QUEUE_WAIT_TIMEOUT_MS` |
 
 Other endpoints: `GET /healthz`, `GET /metrics` (Prometheus).
@@ -58,7 +59,9 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 
 `PORT`, `PROVIDER_URL`, `PROVIDER_API_KEY`, `PROVIDER_TIMEOUT_MS`, `REDIS_ADDR`,
 `RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `RATELIMIT_BACKEND` (`local`|`redis`, default `redis` when `REDIS_ADDR` is set),
-`RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD`, `CACHE_TTL_SECONDS`,
+`RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD` (default monthly cap, 0 = unlimited), `TEAM_BUDGETS` (`team-a=50,team-b=10`),
+`BUDGET_BACKEND` (`memory`|`redis`), `BUDGET_ALERT_FRACTION` (default 0.8), `BUDGET_FAIL_MODE` (`open`|`closed`),
+`BUDGET_REDIS_TIMEOUT_MS` (default 50), `CACHE_TTL_SECONDS`,
 `CACHE_BACKEND` (`memory`|`redis`, default `redis` when `REDIS_ADDR` is set), `CACHE_REDIS_TIMEOUT_MS` (default 50; a slower lookup counts as a miss),
 `ROUTER_MAX_CHEAP_CHARS`.
 
