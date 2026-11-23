@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -25,22 +26,29 @@ import (
 
 var testUsage = api.Usage{PromptTokens: 100, CompletionTokens: 200, TotalTokens: 300}
 
-type fakeProvider struct{ calls atomic.Int32 }
+type fakeProvider struct {
+	calls atomic.Int32
+	delay time.Duration
+}
 
 func (p *fakeProvider) Complete(_ context.Context, model string, _ *api.ChatRequest) (*api.ChatResponse, error) {
 	p.calls.Add(1)
+	time.Sleep(p.delay)
 	return &api.ChatResponse{ID: "x", Model: model, Usage: testUsage}, nil
 }
 
-func newTestServer(cacheOn bool) (*server, *fakeProvider) {
+func newTestServer(cacheOn bool, mode cache.CoalesceMode) (*server, *fakeProvider) {
 	reg := metrics.New()
 	p := &fakeProvider{}
+	mem := cache.NewMemory()
+	co, _ := cache.NewCoalescer(mode, mem, reg)
 	return &server{
 		limiter:  ratelimit.NewLocal(1000, 1000),
 		budget:   budget.NewMemory(budget.Limits{}), // unlimited
-		cache:    cache.NewInstrumented(cache.NewMemory(), reg),
+		cache:    cache.NewInstrumented(mem, reg),
 		cacheOn:  cacheOn,
 		cacheTTL: time.Minute,
+		coalesce: co,
 		router:   router.LengthRouter{MaxCheapChars: 500},
 		provider: p,
 		metrics:  reg,
@@ -55,8 +63,8 @@ func send(t *testing.T, s *server) *httptest.ResponseRecorder {
 	r.Header.Set("Authorization", "Bearer test-key")
 	w := httptest.NewRecorder()
 	s.handleChat(w, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK { // Errorf, not Fatalf: send also runs in goroutines
+		t.Errorf("status %d: %s", w.Code, w.Body.String())
 	}
 	return w
 }
@@ -79,7 +87,7 @@ func metric(t *testing.T, s *server, name string) float64 {
 }
 
 func TestCacheHitRecordsCostSaved(t *testing.T) {
-	s, p := newTestServer(true)
+	s, p := newTestServer(true, cache.CoalesceOff)
 	if got := send(t, s).Header().Get(api.HeaderCache); got != "MISS" {
 		t.Fatalf("first request X-Cache=%s, want MISS", got)
 	}
@@ -106,7 +114,7 @@ func TestCacheHitRecordsCostSaved(t *testing.T) {
 }
 
 func TestCacheDisabledBypasses(t *testing.T) {
-	s, p := newTestServer(false)
+	s, p := newTestServer(false, cache.CoalesceOff)
 	for i := 0; i < 2; i++ {
 		if got := send(t, s).Header().Get(api.HeaderCache); got != "BYPASS" {
 			t.Fatalf("X-Cache=%s, want BYPASS", got)
@@ -134,7 +142,7 @@ func sendPrompt(s *server, team, prompt string) *httptest.ResponseRecorder {
 // Over budget: new prompts get 402, but cached answers (free) are still served
 // and other teams are unaffected.
 func TestBudgetBlocksMissesButServesHits(t *testing.T) {
-	s, p := newTestServer(true)
+	s, p := newTestServer(true, cache.CoalesceOff)
 	oneCall := provider.Cost("cheap", testUsage)
 	s.budget = budget.NewMemory(budget.Limits{PerTeam: map[string]float64{"small": oneCall}})
 
@@ -186,7 +194,7 @@ func TestQueueErrorsMapToStatus(t *testing.T) {
 		{queue.ErrTimeout, http.StatusGatewayTimeout, 0},
 		{fmt.Errorf("%w: redis down", queue.ErrUnavailable), http.StatusOK, 1},
 	} {
-		s, p := newTestServer(false)
+		s, p := newTestServer(false, cache.CoalesceOff)
 		s.queue, s.pacer = fakeQueue{tc.err}, denyPacer{}
 		if w := sendPrompt(s, "t", "x"); w.Code != tc.code {
 			t.Errorf("%v: status %d, want %d (%s)", tc.err, w.Code, tc.code, w.Body.String())
@@ -212,7 +220,7 @@ func (slowProvider) Complete(ctx context.Context, _ string, _ *api.ChatRequest) 
 }
 
 func TestBadRequests(t *testing.T) {
-	s, p := newTestServer(true)
+	s, p := newTestServer(true, cache.CoalesceOff)
 	for _, tc := range []struct {
 		name, auth, body string
 		code             int
@@ -248,7 +256,7 @@ func TestUpstreamErrorsMapToStatus(t *testing.T) {
 		{http.StatusTooManyRequests, http.StatusTooManyRequests},
 		{http.StatusInternalServerError, http.StatusBadGateway},
 	} {
-		s, _ := newTestServer(true)
+		s, _ := newTestServer(true, cache.CoalesceOff)
 		s.provider = errProvider{&provider.StatusError{Code: tc.upstream, Body: "boom"}}
 		w := sendPrompt(s, "t", "x")
 		if w.Code != tc.want {
@@ -266,7 +274,7 @@ func TestUpstreamErrorsMapToStatus(t *testing.T) {
 }
 
 func TestProviderCallTimesOut(t *testing.T) {
-	s, _ := newTestServer(false)
+	s, _ := newTestServer(false, cache.CoalesceOff)
 	s.provider = slowProvider{}
 	s.reqTimeout = 50 * time.Millisecond
 	start := time.Now()
@@ -278,3 +286,85 @@ func TestProviderCallTimesOut(t *testing.T) {
 		t.Errorf("request took %v, the timeout did not fire", d)
 	}
 }
+
+// The #13 acceptance test: 100 concurrent identical prompts, 1 provider call.
+func TestCoalesce100ConcurrentTo1(t *testing.T) {
+	s, p := newTestServer(true, cache.CoalesceLocal)
+	p.delay = 200 * time.Millisecond
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	got := map[string]int{}
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			x := send(t, s).Header().Get(api.HeaderCache)
+			mu.Lock()
+			got[x]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if n := p.calls.Load(); n != 1 {
+		t.Fatalf("provider calls = %d, want 1 (X-Cache counts %v)", n, got)
+	}
+	if got["MISS"] != 1 || got["COALESCED"]+got["HIT"] != 99 {
+		t.Fatalf("X-Cache counts %v, want 1 MISS and 99 COALESCED or HIT", got)
+	}
+	cost := provider.Cost("cheap", testUsage)
+	if v := metric(t, s, `cost_usd_total{model="cheap"}`); v != cost {
+		t.Errorf("cost paid = %v, want one call (%v)", v, cost)
+	}
+	if v := metric(t, s, `cache_coalesced_total{level="local"}`); int(v) != got["COALESCED"] {
+		t.Errorf("coalesced metric = %v, want %d", v, got["COALESCED"])
+	}
+}
+
+func TestCoalesceOffEveryMissCalls(t *testing.T) {
+	s, p := newTestServer(true, cache.CoalesceOff)
+	p.delay = 100 * time.Millisecond
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); send(t, s) }()
+	}
+	wg.Wait()
+	if n := p.calls.Load(); n != 20 {
+		t.Fatalf("provider calls = %d, want 20 with coalescing off", n)
+	}
+}
+
+// Coalescing sits in front of the queue: if the one shared call is rejected
+// by the queue, every waiter gets the same status, and no one calls the provider.
+func TestCoalesceSharesQueueError(t *testing.T) {
+	s, p := newTestServer(true, cache.CoalesceLocal)
+	s.queue, s.pacer = slowQueue{err: queue.ErrFull, delay: 100 * time.Millisecond}, denyPacer{}
+	var wg sync.WaitGroup
+	codes := make([]int, 20)
+	for i := range codes {
+		wg.Add(1)
+		go func() { defer wg.Done(); codes[i] = sendPrompt(s, "t", "same").Code }()
+	}
+	wg.Wait()
+	for i, c := range codes {
+		if c != http.StatusServiceUnavailable {
+			t.Errorf("request %d: status %d, want 503 queue_full", i, c)
+		}
+	}
+	if n := p.calls.Load(); n != 0 {
+		t.Errorf("provider calls = %d, want 0", n)
+	}
+}
+
+// slowQueue is fakeQueue with a delay, so concurrent requests overlap.
+type slowQueue struct {
+	err   error
+	delay time.Duration
+}
+
+func (q slowQueue) Submit(context.Context, string, *api.ChatRequest) (*api.ChatResponse, error) {
+	time.Sleep(q.delay)
+	return nil, q.err
+}
+func (slowQueue) Depth(context.Context) (int64, error) { return 0, nil }
+func (slowQueue) Close() error                         { return nil }

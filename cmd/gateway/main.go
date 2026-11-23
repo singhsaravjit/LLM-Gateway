@@ -41,7 +41,8 @@ type server struct {
 	cache      cache.Cache
 	cacheOn    bool // CACHE_ENABLED; false skips the cache for every request
 	cacheTTL   time.Duration
-	reqTimeout time.Duration // REQUEST_TIMEOUT_MS for direct provider calls; 0 = no limit
+	reqTimeout time.Duration    // REQUEST_TIMEOUT_MS for direct provider calls; 0 = no limit
+	coalesce   *cache.Coalescer // CACHE_COALESCE; groups identical in-flight misses
 	router     router.Router
 	provider   provider.Client
 	queue      queue.Queue // nil when QUEUE_ENABLED=false
@@ -89,6 +90,11 @@ func main() {
 		log.Error("queue config", "err", err)
 		os.Exit(1)
 	}
+	coalescer, err := newCoalescer(log, rdb, respCache, reg, cfg)
+	if err != nil {
+		log.Error("coalescing config", "err", err)
+		os.Exit(1)
+	}
 	s := &server{
 		limiter:    limiter,
 		budget:     budgets,
@@ -96,6 +102,7 @@ func main() {
 		cacheOn:    cfg.CacheEnabled,
 		cacheTTL:   cfg.CacheTTL,
 		reqTimeout: cfg.RequestTimeout,
+		coalesce:   coalescer,
 		router:     router.LengthRouter{MaxCheapChars: cfg.MaxCheapChars},
 		provider:   prov,
 		queue:      q,
@@ -224,8 +231,27 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusPaymentRequired, "budget_exceeded", "team budget exhausted")
 		return
 	}
-	// 4. Provider call, through the overflow queue when the provider is at its limit.
-	resp, err := s.callProvider(ctx, reqID, model, &req)
+	// 4. Provider call, through the overflow queue when the provider is at
+	// its limit. On a miss it also goes through the coalescer, so identical
+	// requests in flight share one provider call (CACHE_COALESCE). fetch
+	// stores the answer before returning, so waiters on other nodes find it
+	// in the cache.
+	fetch := func(fctx context.Context) (*api.ChatResponse, error) {
+		resp, err := s.callProvider(fctx, reqID, model, &req)
+		if err == nil && useCache {
+			if err := s.cache.Set(fctx, ckey, resp, s.cacheTTL); err != nil {
+				s.log.Warn("cache set error", "request_id", reqID, "err", err)
+			}
+		}
+		return resp, err
+	}
+	var resp *api.ChatResponse
+	outcome := cache.Fetched
+	if useCache {
+		resp, outcome, err = s.coalesce.Do(ctx, ckey, fetch)
+	} else {
+		resp, err = fetch(ctx)
+	}
 	switch {
 	case errors.Is(err, queue.ErrFull):
 		s.metrics.Inc(`requests_total{result="queue_full"}`, 1)
@@ -252,13 +278,13 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, status, "upstream_error", "provider request failed")
 		return
 	}
+	if outcome != cache.Fetched {
+		// Another request paid for this answer; this one waited for it.
+		s.finish(w, reqID, key, team, model, "COALESCED", resp, 0, provider.Cost(model, resp.Usage), start)
+		return
+	}
 	cost := provider.Cost(model, resp.Usage)
 	s.recordSpend(ctx, reqID, team, cost)
-	if useCache {
-		if err := s.cache.Set(ctx, ckey, resp, s.cacheTTL); err != nil {
-			s.log.Warn("cache set error", "request_id", reqID, "err", err)
-		}
-	}
 	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, 0, start)
 }
 
@@ -518,6 +544,40 @@ func newCache(log *slog.Logger, client *redis.Client) (cache.Cache, error) {
 		return cache.NewRedis(client, cache.WithTimeout(timeout)), nil
 	}
 	return nil, fmt.Errorf("unknown CACHE_BACKEND %q (want memory|redis)", backend)
+}
+
+// newCoalescer picks request coalescing from config:
+//
+//	CACHE_COALESCE          off | local | redis (default off)
+//	                        local: one provider call per key per node (singleflight)
+//	                        redis: one per key per cluster (lock:<key> in Redis); needs CACHE_BACKEND=redis
+//	CACHE_COALESCE_WAIT_MS  how long a waiter polls for another node's answer before calling the provider (default 5000)
+//	CACHE_COALESCE_POLL_MS  poll interval (default 50)
+//
+// The lock TTL is REQUEST_TIMEOUT_MS + 1 s (the longest a direct provider call
+// can take), so a crashed holder frees the key.
+func newCoalescer(log *slog.Logger, client *redis.Client, c cache.Cache, reg *metrics.Registry, cfg config) (*cache.Coalescer, error) {
+	mode, err := cache.ParseCoalesceMode(os.Getenv("CACHE_COALESCE"))
+	if err != nil {
+		return nil, err
+	}
+	if mode != cache.CoalesceRedis {
+		log.Info("coalescing", "mode", mode)
+		return cache.NewCoalescer(mode, c, reg)
+	}
+	if _, ok := c.(*cache.Redis); !ok || client == nil {
+		return nil, errors.New("CACHE_COALESCE=redis requires REDIS_ADDR and the redis cache backend")
+	}
+	if !cfg.CacheEnabled || cfg.CacheTTL <= 0 {
+		return nil, errors.New("CACHE_COALESCE=redis needs the cache on with CACHE_TTL_SECONDS > 0 (waiters read the answer from the cache)")
+	}
+	lockTTL := cfg.RequestTimeout + time.Second // covers a direct provider call with its retries
+	wait := time.Duration(envInt("CACHE_COALESCE_WAIT_MS", 5000)) * time.Millisecond
+	poll := time.Duration(envInt("CACHE_COALESCE_POLL_MS", 50)) * time.Millisecond
+	timeout := time.Duration(envInt("CACHE_REDIS_TIMEOUT_MS", 50)) * time.Millisecond
+	log.Info("coalescing", "mode", mode, "lock_ttl", lockTTL.String(), "wait", wait.String(), "poll", poll.String())
+	return cache.NewCoalescer(mode, c, reg, cache.WithRedisLock(client, lockTTL),
+		cache.WithWait(wait, poll), cache.WithLockTimeout(timeout))
 }
 
 // newRedis builds the shared Redis client from REDIS_* env vars (see
