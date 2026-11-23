@@ -51,19 +51,34 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 
 ```json
 {"msg":"request","request_id":"…","api_key":"****abcd","team":"…","model":"cheap",
- "cache":"HIT","tokens":188,"cost_usd":0.000055,"latency_ms":12}
+ "cache":"HIT","tokens":188,"cost_usd":0,"cost_saved_usd":0.000055,"latency_ms":12}
 ```
 
 ## Environment variables (gateway)
 
 `PORT`, `PROVIDER_URL`, `PROVIDER_API_KEY`, `PROVIDER_TIMEOUT_MS`, `REDIS_ADDR`,
 `RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `RATELIMIT_BACKEND` (`local`|`redis`, default `redis` when `REDIS_ADDR` is set),
-`RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD`, `CACHE_TTL_SECONDS`,
+`RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD`, `CACHE_ENABLED` (default `true`; `false` sends every request to the provider as `BYPASS`), `CACHE_TTL_SECONDS` (default 300),
 `CACHE_BACKEND` (`memory`|`redis`, default `redis` when `REDIS_ADDR` is set), `CACHE_REDIS_TIMEOUT_MS` (default 50; a slower lookup counts as a miss),
 `ROUTER_MAX_CHEAP_CHARS`.
 
 The cache fails open: if Redis is slow or down, the request is served as a `MISS` from the provider and
 `llmgw_cache_errors_total{op="get"|"set"}` is incremented.
+
+Cache metrics (all prefixed `llmgw_`):
+
+| Metric | Meaning |
+|---|---|
+| `cache_lookups_total{result="hit"\|"miss"\|"error"}` | one per lookup (an error is served as a miss) |
+| `cache_errors_total{op="get"\|"set"}` | Redis slow or down |
+| `cache_lookup_seconds_bucket{le}`, `_sum`, `_count` | lookup latency histogram |
+| `cost_saved_usd_total{model}` | on a hit, what the provider would have charged for the cached response's usage |
+
+Example queries: hit rate `sum(rate(llmgw_cache_lookups_total{result="hit"}[1m])) / sum(rate(llmgw_cache_lookups_total[1m]))`,
+dollars saved `sum(llmgw_cost_saved_usd_total)`, lookup p95
+`histogram_quantile(0.95, sum by (le) (rate(llmgw_cache_lookup_seconds_bucket[1m])))`.
+These panels are in the Grafana dashboard "LLM Gateway: Cache"
+(`deploy/grafana/provisioning/dashboards/cache.json`, loaded automatically by `docker compose up`).
 
 Shared Redis client (`internal/redisx`, one pool for all components; unset means go-redis default):
 `REDIS_POOL_SIZE` (default 10 per CPU), `REDIS_DIAL_TIMEOUT_MS` (5000), `REDIS_READ_TIMEOUT_MS` (3000),
