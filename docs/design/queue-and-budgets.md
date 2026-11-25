@@ -66,6 +66,8 @@ Details:
 - **Queue bound:** `XLEN` check before `XADD`. Concurrent producers can overshoot `QUEUE_MAX` slightly; acceptable and documented. We do *not* use `XADD MAXLEN` because trimming would silently drop jobs we already accepted.
 - **Deadlines** travel with the job so workers never spend money on a request whose client has timed out.
 - **Crash recovery:** a background loop `XAUTOCLAIM`s entries pending longer than `QUEUE_VISIBILITY_TIMEOUT` (worker died mid-job). Reply streams get `MAXLEN ~1000` and an `EXPIRE`, so replies to dead nodes vanish.
+  *Found while implementing (#17):* the visibility timeout must exceed the wait timeout, or a slow but live job could run (and be billed) twice. So when a crashed worker's job is reclaimed, its client has already timed out: reclaiming **cleans up** the orphan (accurate queue depth, no wasted provider call) rather than answering it. Answering it would need worker heartbeats, which is not worth it at our scale.
+- **Redis down:** `Submit` fails fast with `ErrUnavailable` and the gateway calls the provider directly (fail open). The provider pacer also fails open. Redis being down at startup doesn't stop the gateway; workers create the consumer group when Redis returns.
 - **Node id:** ECS task id (or hostname) at startup.
 
 ### Config

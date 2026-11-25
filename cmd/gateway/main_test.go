@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 	"github.com/singhsaravjit/llm-gateway/internal/cache"
 	"github.com/singhsaravjit/llm-gateway/internal/metrics"
 	"github.com/singhsaravjit/llm-gateway/internal/provider"
+	"github.com/singhsaravjit/llm-gateway/internal/queue"
 	"github.com/singhsaravjit/llm-gateway/internal/ratelimit"
 	"github.com/singhsaravjit/llm-gateway/internal/router"
 )
@@ -154,5 +156,43 @@ func TestBudgetBlocksMissesButServesHits(t *testing.T) {
 	}
 	if got := metric(t, s, `requests_total{result="budget_exceeded"}`); got != 1 {
 		t.Errorf("budget_exceeded = %v, want 1", got)
+	}
+}
+
+// fakeQueue returns a fixed error from Submit.
+type fakeQueue struct{ err error }
+
+func (f fakeQueue) Submit(context.Context, string, *api.ChatRequest) (*api.ChatResponse, error) {
+	return nil, f.err
+}
+func (fakeQueue) Depth(context.Context) (int64, error) { return 0, nil }
+func (fakeQueue) Close() error                         { return nil }
+
+type denyPacer struct{}
+
+func (denyPacer) TryAcquire(context.Context, string) bool  { return false }
+func (denyPacer) Wait(ctx context.Context, _ string) error { return ctx.Err() }
+
+// With the provider at its limit, requests go to the queue; a full queue is
+// 503 queue_full, a queue timeout 504, and a Redis failure falls back to a
+// direct provider call.
+func TestQueueErrorsMapToStatus(t *testing.T) {
+	for _, tc := range []struct {
+		err       error
+		code      int
+		providerN int32
+	}{
+		{queue.ErrFull, http.StatusServiceUnavailable, 0},
+		{queue.ErrTimeout, http.StatusGatewayTimeout, 0},
+		{fmt.Errorf("%w: redis down", queue.ErrUnavailable), http.StatusOK, 1},
+	} {
+		s, p := newTestServer(false)
+		s.queue, s.pacer = fakeQueue{tc.err}, denyPacer{}
+		if w := sendPrompt(s, "t", "x"); w.Code != tc.code {
+			t.Errorf("%v: status %d, want %d (%s)", tc.err, w.Code, tc.code, w.Body.String())
+		}
+		if n := p.calls.Load(); n != tc.providerN {
+			t.Errorf("%v: provider calls = %d, want %d", tc.err, n, tc.providerN)
+		}
 	}
 }

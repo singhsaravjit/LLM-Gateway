@@ -27,6 +27,13 @@ func (r *Registry) Inc(name string, v float64) {
 	r.mu.Unlock()
 }
 
+// Set sets a gauge (a value that goes up and down, e.g. queue depth).
+func (r *Registry) Set(name string, v float64) {
+	r.mu.Lock()
+	r.counters[name] = v
+	r.mu.Unlock()
+}
+
 func (r *Registry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		r.mu.Lock()
