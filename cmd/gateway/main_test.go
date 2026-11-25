@@ -35,7 +35,7 @@ func newTestServer(cacheOn bool) (*server, *fakeProvider) {
 	p := &fakeProvider{}
 	return &server{
 		limiter:  ratelimit.NewLocal(1000, 1000),
-		budget:   budget.NewMemory(0),
+		budget:   budget.NewMemory(budget.Limits{}), // unlimited
 		cache:    cache.NewInstrumented(cache.NewMemory(), reg),
 		cacheOn:  cacheOn,
 		cacheTTL: time.Minute,
@@ -115,5 +115,44 @@ func TestCacheDisabledBypasses(t *testing.T) {
 	}
 	if got := metric(t, s, "cache_lookup_seconds_count"); got != 0 {
 		t.Errorf("cache was looked up %v times with CACHE_ENABLED=false", got)
+	}
+}
+
+// sendPrompt is send without the 200 check, for a given prompt and team.
+func sendPrompt(s *server, team, prompt string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"messages":[{"role":"user","content":"`+prompt+`"}]}`))
+	r.Header.Set("Authorization", "Bearer test-key")
+	r.Header.Set(api.HeaderTeam, team)
+	w := httptest.NewRecorder()
+	s.handleChat(w, r)
+	return w
+}
+
+// Over budget: new prompts get 402, but cached answers (free) are still served
+// and other teams are unaffected.
+func TestBudgetBlocksMissesButServesHits(t *testing.T) {
+	s, p := newTestServer(true)
+	oneCall := provider.Cost("cheap", testUsage)
+	s.budget = budget.NewMemory(budget.Limits{PerTeam: map[string]float64{"small": oneCall}})
+
+	if w := sendPrompt(s, "small", "first"); w.Code != http.StatusOK {
+		t.Fatalf("first request: %d %s", w.Code, w.Body.String())
+	}
+	if w := sendPrompt(s, "small", "second"); w.Code != http.StatusPaymentRequired {
+		t.Fatalf("over budget, new prompt: %d, want 402", w.Code)
+	}
+	w := sendPrompt(s, "small", "first")
+	if w.Code != http.StatusOK || w.Header().Get(api.HeaderCache) != "HIT" {
+		t.Fatalf("over budget, cached prompt: %d X-Cache=%s, want 200 HIT", w.Code, w.Header().Get(api.HeaderCache))
+	}
+	if w := sendPrompt(s, "other", "second"); w.Code != http.StatusOK {
+		t.Fatalf("other team: %d, want 200", w.Code)
+	}
+	if n := p.calls.Load(); n != 2 {
+		t.Errorf("provider calls = %d, want 2 (the 402 and the hit must not call it)", n)
+	}
+	if got := metric(t, s, `requests_total{result="budget_exceeded"}`); got != 1 {
+		t.Errorf("budget_exceeded = %v, want 1", got)
 	}
 }
