@@ -142,7 +142,10 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// 1. Rate limit. On a limiter (Redis) error the decision already reflects
 	// the configured fail mode; we count the error and act on the decision.
+	limStart := time.Now()
 	d, err := s.limiter.Allow(ctx, key)
+	s.metrics.Inc("ratelimit_check_seconds_sum", time.Since(limStart).Seconds()) // Experiment 3: cost of the check
+	s.metrics.Inc("ratelimit_check_seconds_count", 1)
 	if err != nil {
 		s.metrics.Inc("ratelimit_errors_total", 1)
 		s.log.Warn("rate limiter error", "request_id", reqID, "err", err, "allowed", d.Allowed)

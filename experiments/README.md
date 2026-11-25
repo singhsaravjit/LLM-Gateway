@@ -14,3 +14,23 @@ Change **one setting at a time** and always compare against the baseline
 | 5  | Queueing under 429s        | Saravjit | queue on/off, size, load above provider limit   | success rate, p99, dropped requests       | MVP     |
 | 6  | Routing and failover       | Preshit  | cheap-model share; errors injected into strong  | cost/1k req, failover time, error rate    | Stretch |
 | 7  | Horizontal scaling         | Kanad    | load level, autoscaling thresholds              | max throughput, scale-out/in time         | MVP     |
+
+## Tooling (Exp 3–5)
+
+| Path | What |
+|---|---|
+| `tools/loadgen` | Open-loop load generator: fixed arrival rate, round-robin over nodes, per-request CSV. Used instead of Locust where the offered load must stay constant even when the system slows down (Locust is closed-loop). |
+| `tools/common.sh` | Starts the mock and N real gateway processes against a Redis you provide. |
+| `tools/charts.py` | Report charts from the run CSVs (`pip install matplotlib`). |
+| `0N-*/run.sh` | One script per experiment; writes `results/summary.csv`, raw per-request CSVs and logs. |
+| `0N-*/RESULTS.md` | Setup as run, tables, charts, findings, caveats, what is left. |
+
+## Status
+
+| # | Status |
+|---|---|
+| 3 | Preliminary results, local (3 repeats) — [RESULTS](03-ratelimit/RESULTS.md) |
+| 4 | Preliminary results, local (1 run per case) — [RESULTS](04-redis-failure/RESULTS.md) |
+| 5 | Preliminary results, local (2 repeats steady, 1 burst) — [RESULTS](05-queueing/RESULTS.md) |
+
+All three are to be repeated on ECS once the AWS stack (#21, #22) is up.

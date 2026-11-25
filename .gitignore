@@ -24,3 +24,7 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Experiment binaries and logs
+experiments/.bin/
+experiments/*/results/logs/
