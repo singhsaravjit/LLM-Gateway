@@ -6,7 +6,8 @@
 # Mock provider limited to 50 rps with 800 ± 300 ms latency. 2 gateway nodes,
 # cache off, 50 API keys (so per-key limits never interfere). Provider pacer
 # at 45 rps, shared through Redis. Queue wait timeout 30 s, client timeout 60 s.
-# Env overrides: DUR (40s), LOADS ("25 50 75 100 150"), CONFIGS ("off on1000 on100").
+# Env overrides: DUR (40s), LOADS ("25 50 75 100 150"), CONFIGS ("off on1000 on100"),
+# BURSTS ("short long"; "" = none), APPEND (1 = add to an existing summary.csv).
 source "$(dirname "$0")/../tools/common.sh"
 RESULTS="$ROOT/experiments/05-queueing/results"
 mkdir -p "$RESULTS/logs" "$RESULTS/raw" "$RESULTS/timeline"
@@ -46,7 +47,7 @@ run_one() { # name shape config
 import json, sys
 s = json.loads(sys.argv[1]); name, cfg, shape, up429, full, tmo, depth = sys.argv[2:]
 c = s["codes"]
-print(",".join(map(str, [name, cfg, shape, s["sent"], f'{s["success_pct"]:.1f}', c.get("429", 0), c.get("503", 0),
+print(",".join(map(str, [name, cfg, shape.replace(",", "+"), s["sent"], f'{s["success_pct"]:.1f}', c.get("429", 0), c.get("503", 0),
       c.get("504", 0), c.get("502", 0) + c.get("0", 0), round(s["p50_ms"]), round(s["p95_ms"]), round(s["p99_ms"]),
       int(float(up429)), int(float(depth))])))
 PY
@@ -54,11 +55,20 @@ PY
 }
 
 SUMMARY="$RESULTS/summary.csv"
-echo "run,config,shape,sent,success_pct,client_429,client_503_full,client_504_timeout,other_errors,p50_ms,p95_ms,p99_ms,upstream_429,max_queue_depth" >"$SUMMARY"
+[ "${APPEND:-0}" = 1 ] && [ -f "$SUMMARY" ] || echo "run,config,shape,sent,success_pct,client_429,client_503_full,client_504_timeout,other_errors,p50_ms,p95_ms,p99_ms,upstream_429,max_queue_depth" >"$SUMMARY"
 start_mock LATENCY_MS_MEAN=800 LATENCY_MS_JITTER=300 RATE_LIMIT_RPS=50
-for cfg in $CONFIGS; do
+for cfg in ${CONFIGS}; do
+  [ -z "$LOADS" ] && break
   for rps in $LOADS; do run_one "$cfg-${rps}rps" "$rps:$DUR" "$cfg"; done
 done
-# Burst shape: 20 s at 3x the provider limit, then 40 s at 0.5x.
-for cfg in off on1000; do run_one "$cfg-burst" "150:20s,25:40s" "$cfg"; done
+# Bursts at 3x the provider limit, then 0.5x. "short" (5 s, ~525 extra
+# requests) fits in a 1000-slot queue; "long" (20 s, ~2,100 extra) does not.
+for kind in ${BURSTS-short long}; do
+  for cfg in off on1000; do
+    case $kind in
+      short) run_one "$cfg-shortburst" "150:5s,25:55s" "$cfg" ;;
+      long)  run_one "$cfg-burst" "150:20s,25:40s" "$cfg" ;;
+    esac
+  done
+done
 echo "done: $SUMMARY"

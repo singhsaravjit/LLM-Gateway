@@ -43,6 +43,18 @@ def label_end(ax, x, y, text, color_dummy=None, dy=0):
     ax.annotate(text, (x, y), xytext=(6, dy), textcoords="offset points", va="center", color=TEXT, fontsize=8)
 
 
+def label_column(ax, items, min_gap):
+    """Direct labels at line ends, nudged apart vertically so they never overlap.
+    items: [(x, y, text)]; min_gap in data units."""
+    items = sorted(items, key=lambda i: i[1])
+    ys = []
+    for _, y, _ in items:
+        ys.append(max(y, ys[-1] + min_gap) if ys else y)
+    for (x, y, text), ly in zip(items, ys):
+        ax.annotate(text, (x, y), xytext=(x + 0.12, ly), textcoords="data", va="center", color=TEXT, fontsize=8,
+                    arrowprops=dict(arrowstyle="-", color=GRID, lw=0.8) if abs(ly - y) > min_gap / 4 else None)
+
+
 def save(fig, path):
     fig.tight_layout()
     fig.savefig(path, facecolor="white")
@@ -143,7 +155,7 @@ def exp4():
 def exp5():
     d = os.path.join(ROOT, "experiments/05-queueing/results")
     rows = read(os.path.join(d, "summary.csv"))
-    steady = [r for r in rows if not r["run"].endswith("burst")]
+    steady = [r for r in rows if "burst" not in r["run"]]
     styles = {"off": (ORANGE, "o", "--", "Queue off"), "on1000": (BLUE, "s", "-", "Queue on (max 1000)"),
               "on100": (AQUA, "^", ":", "Queue on (max 100)")}
 
@@ -157,17 +169,24 @@ def exp5():
          "{:.1f} s"),
     ]:
         fig, ax = plt.subplots(figsize=(6, 3.4))
+        ends = []
         for cfg, (color, marker, ls, name) in styles.items():
-            pts = sorted((offered(r), float(r[metric])) for r in steady if r["config"] == cfg)
+            agg = defaultdict(list)  # average over repeats
+            for r in steady:
+                if r["config"] == cfg:
+                    agg[offered(r)].append(float(r[metric]))
+            pts = sorted((x, statistics.mean(v)) for x, v in agg.items())
             if not pts:
                 continue
             xs = [p[0] for p in pts]
             ys = [p[1] / (1000 if metric == "p99_ms" else 1) for p in pts]
             ax.plot(xs, ys, color=color, marker=marker, markersize=6, linestyle=ls)
-            label_end(ax, xs[-1], ys[-1], f"{name}  " + fmt.format(ys[-1]),
-                      dy={"off": -8, "on1000": 8, "on100": 0}[cfg] if metric == "success_pct" else 0)
+            ends.append((xs[-1], ys[-1], f"{name}  " + fmt.format(ys[-1])))
+        label_column(ax, ends, min_gap=7 if metric == "success_pct" else 2.2)
         ax.axvline(1, color=TEXT2, linewidth=0.8, linestyle=(0, (1, 2)))
-        ax.text(1.02, 0.03, "provider limit", transform=ax.get_xaxis_transform(), color=TEXT2, fontsize=7)
+        top = metric != "success_pct"  # keep the note off the lines
+        ax.text(1.03, 0.97 if top else 0.03, "provider limit", transform=ax.get_xaxis_transform(), color=TEXT2,
+                fontsize=7, va="top" if top else "bottom")
         ax.set_xlabel("Offered load (× provider limit of 50 rps)")
         ax.set_ylabel(ylabel)
         ax.set_xlim(0.4, 4.6)
@@ -175,29 +194,35 @@ def exp5():
         ax.set_title(title + " (provider: 50 rps, 800 ms)", loc="left")
         save(fig, os.path.join(d, fname))
 
-    # Burst: per-second outcomes, queue off vs on, plus queue depth.
+    for kind, secs, fname, title in [("shortburst", 5, "burst_short.png", "5 s burst at 3× the provider limit, then 0.5×"),
+                                     ("burst", 20, "burst_long.png", "20 s burst at 3× the provider limit, then 0.5×")]:
+        burst_fig(d, kind, secs, fname, title)
+
+
+def burst_fig(d, kind, secs, fname, title):
+    """Per-second outcomes, queue off vs on, plus queue depth."""
     fig, axes = plt.subplots(3, 1, figsize=(7, 6.2), sharex=True)
     for ax, cfg, name in [(axes[0], "off", "Queue off"), (axes[1], "on1000", "Queue on (max 1000)")]:
-        path = os.path.join(d, "raw", f"{cfg}-burst.csv")
+        path = os.path.join(d, "raw", f"{cfg}-{kind}.csv")
         if not os.path.exists(path):
             continue
         ok, r429, r503, r504, other = per_second(read(path), 60)
         t = list(range(60))
-        ax.axvspan(0, 20, color=GRID, alpha=0.7, linewidth=0)
+        ax.axvspan(0, secs, color=GRID, alpha=0.7, linewidth=0)
         ax.plot(t, ok, color=BLUE, label="Succeeded")
         ax.plot(t, [a + b + c for a, b, c in zip(r429, r503, r504)], color=ORANGE, linestyle="--",
                 label="Failed (429/503/504)")
         ax.set_title(f"{name}: requests by send time", loc="left")
         ax.set_ylabel("Requests / s")
-    axes[0].text(10, 0.97, "burst: 150 rps (3×)", transform=axes[0].get_xaxis_transform(), ha="center", va="top",
+    axes[0].text(secs + 1, 0.97, "← burst: 150 rps", transform=axes[0].get_xaxis_transform(), ha="left", va="top",
                  color=TEXT2, fontsize=8)
     axes[0].legend(frameon=False, fontsize=8, loc="center right")
-    dp = os.path.join(d, "timeline", "on1000-burst-depth.csv")
+    dp = os.path.join(d, "timeline", f"on1000-{kind}-depth.csv")
     if os.path.exists(dp):
         dep = read(dp)
         xs = [int(r["t_s"]) for r in dep]
         ys = [int(r["queue_depth"]) for r in dep]
-        axes[2].axvspan(0, 20, color=GRID, alpha=0.7, linewidth=0)
+        axes[2].axvspan(0, secs, color=GRID, alpha=0.7, linewidth=0)
         axes[2].plot(xs, ys, color=BLUE)
         peak = max(range(len(ys)), key=lambda i: ys[i])
         axes[2].annotate(f"peak {ys[peak]}", (xs[peak], ys[peak]), xytext=(6, 0), textcoords="offset points",
@@ -205,12 +230,11 @@ def exp5():
         axes[2].set_title("Queue on: queue depth (all nodes)", loc="left")
         axes[2].set_ylabel("Jobs waiting")
     axes[2].set_xlabel("Seconds since start")
-    fig.suptitle("Exp 5 · 20 s burst at 3× the provider limit, then 0.5×", x=0.01, ha="left", fontweight="bold",
-                 fontsize=10, color=TEXT)
+    fig.suptitle("Exp 5 · " + title, x=0.01, ha="left", fontweight="bold", fontsize=10, color=TEXT)
     fig.tight_layout()
-    fig.savefig(os.path.join(d, "burst.png"), facecolor="white")
+    fig.savefig(os.path.join(d, fname), facecolor="white")
     plt.close(fig)
-    print("wrote", os.path.relpath(os.path.join(d, "burst.png"), ROOT))
+    print("wrote", os.path.relpath(os.path.join(d, fname), ROOT))
 
 
 if __name__ == "__main__":
