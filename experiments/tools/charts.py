@@ -129,8 +129,8 @@ def exp4():
         ok, r429, r503, _, other = per_second(read(path), 40)
         t = list(range(40))
         ax.axvspan(10, 25, color=GRID, alpha=0.7, linewidth=0)
-        ax.text(17.5, 0.97, "Redis down" if kind == "down" else "Redis hung", transform=ax.get_xaxis_transform(),
-                ha="center", va="top", color=TEXT2, fontsize=8)
+        ax.text(17.5, 0.6, "Redis down" if kind == "down" else "Redis hung", transform=ax.get_xaxis_transform(),
+                ha="center", va="center", color=TEXT2, fontsize=8)
         ax.plot(t, ok, color=BLUE, label="Admitted (200)")
         ax.plot(t, r429, color=ORANGE, linestyle="--", label="Rate limited (429)")
         ax.plot(t, r503, color=AQUA, linestyle=":", label="Limiter unavailable (503)")
