@@ -24,11 +24,12 @@ Error body: `{"error": {"type": "...", "message": "..."}}`
 |--------|-------------------|-------------------------------------------|
 | 400    | `bad_request`     | invalid body                              |
 | 401    | `bad_request`     | missing API key                           |
-| 402    | `budget_exceeded` | team over budget                          |
+| 402    | `budget_exceeded` | team over its monthly budget (cache hits are still served) |
 | 429    | `rate_limited`    | per-key limit hit (has `Retry-After`)     |
 | 502    | `upstream_error`  | provider failed after retries/fallback    |
 | 503    | `queue_full`      | backpressure: overflow queue is full      |
 | 503    | `limiter_unavailable` | Redis down and `RATELIMIT_FAIL_MODE=closed` (has `Retry-After`) |
+| 503    | `budget_unavailable` | Redis down and `BUDGET_FAIL_MODE=closed` (has `Retry-After`) |
 | 504    | `queue_timeout`   | waited in the queue longer than `QUEUE_WAIT_TIMEOUT_MS` |
 
 Other endpoints: `GET /healthz`, `GET /metrics` (Prometheus).
@@ -51,14 +52,16 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 
 ```json
 {"msg":"request","request_id":"…","api_key":"****abcd","team":"…","model":"cheap",
- "cache":"HIT","tokens":188,"cost_usd":0.000055,"latency_ms":12}
+ "cache":"HIT","tokens":188,"cost_usd":0,"cost_saved_usd":0.000055,"latency_ms":12}
 ```
 
 ## Environment variables (gateway)
 
 `PORT`, `PROVIDER_URL`, `PROVIDER_API_KEY`, `PROVIDER_TIMEOUT_MS`, `REDIS_ADDR`,
 `RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `RATELIMIT_BACKEND` (`local`|`redis`, default `redis` when `REDIS_ADDR` is set),
-`RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD`, `CACHE_TTL_SECONDS`,
+`RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD` (default monthly cap, 0 = unlimited), `TEAM_BUDGETS` (`team-a=50,team-b=10`),
+`BUDGET_BACKEND` (`memory`|`redis`), `BUDGET_ALERT_FRACTION` (default 0.8), `BUDGET_FAIL_MODE` (`open`|`closed`),
+`BUDGET_REDIS_TIMEOUT_MS` (default 50), `CACHE_ENABLED` (default `true`; `false` sends every request to the provider as `BYPASS`), `CACHE_TTL_SECONDS` (default 300),
 `CACHE_BACKEND` (`memory`|`redis`, default `redis` when `REDIS_ADDR` is set), `CACHE_REDIS_TIMEOUT_MS` (default 50; a slower lookup counts as a miss),
 `ROUTER_MAX_CHEAP_CHARS`,
 `QUEUE_ENABLED` (default `true`), `QUEUE_BACKEND` (`memory`|`redis`), `QUEUE_MAX` (1000), `QUEUE_WAIT_TIMEOUT_MS` (30000),
@@ -67,6 +70,21 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 
 The cache fails open: if Redis is slow or down, the request is served as a `MISS` from the provider and
 `llmgw_cache_errors_total{op="get"|"set"}` is incremented.
+
+Cache metrics (all prefixed `llmgw_`):
+
+| Metric | Meaning |
+|---|---|
+| `cache_lookups_total{result="hit"\|"miss"\|"error"}` | one per lookup (an error is served as a miss) |
+| `cache_errors_total{op="get"\|"set"}` | Redis slow or down |
+| `cache_lookup_seconds_bucket{le}`, `_sum`, `_count` | lookup latency histogram |
+| `cost_saved_usd_total{model}` | on a hit, what the provider would have charged for the cached response's usage |
+
+Example queries: hit rate `sum(rate(llmgw_cache_lookups_total{result="hit"}[1m])) / sum(rate(llmgw_cache_lookups_total[1m]))`,
+dollars saved `sum(llmgw_cost_saved_usd_total)`, lookup p95
+`histogram_quantile(0.95, sum by (le) (rate(llmgw_cache_lookup_seconds_bucket[1m])))`.
+These panels are in the Grafana dashboard "LLM Gateway: Cache"
+(`deploy/grafana/provisioning/dashboards/cache.json`, loaded automatically by `docker compose up`).
 
 Shared Redis client (`internal/redisx`, one pool for all components; unset means go-redis default):
 `REDIS_POOL_SIZE` (default 10 per CPU), `REDIS_DIAL_TIMEOUT_MS` (5000), `REDIS_READ_TIMEOUT_MS` (3000),

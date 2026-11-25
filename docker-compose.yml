@@ -12,6 +12,7 @@ services:
       RATELIMIT_FAIL_MODE: open        # open | closed (Experiment 4)
       QUEUE_ENABLED: "true"            # false = Experiment 5 baseline
       PROVIDER_RPS: "45"               # just under mockllm's RATE_LIMIT_RPS (50)
+      TEAM_BUDGETS: "team-1=5,team-2=5,team-3=5"   # USD/month; Locust uses team-1..3
       CACHE_TTL_SECONDS: "300"
     depends_on: [mockllm, redis]
     deploy: { replicas: 1 }   # scale with: docker compose up --scale gateway=3 (remove ports mapping first)

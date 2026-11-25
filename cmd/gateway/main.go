@@ -1,6 +1,7 @@
 // Command gateway is the LLM request gateway (owner of the HTTP core: Preshit).
 //
-// Request path: rate limit -> budget check -> cache -> router -> provider.
+// Request path: rate limit -> router -> cache -> budget check -> provider.
+// Cache hits cost nothing, so they are served even when a team is over budget.
 // Everything below uses in-memory implementations so it runs with zero setup;
 // each owner swaps in the Redis-backed version of their component.
 package main
@@ -36,6 +37,7 @@ type server struct {
 	limiter  ratelimit.Limiter
 	budget   budget.Tracker
 	cache    cache.Cache
+	cacheOn  bool // CACHE_ENABLED; false skips the cache for every request
 	cacheTTL time.Duration
 	router   router.Router
 	provider provider.Client
@@ -63,9 +65,20 @@ func main() {
 		log.Error("cache config", "err", err)
 		os.Exit(1)
 	}
+	budgets, err := newBudget(log, rdb)
+	if err != nil {
+		log.Error("budget config", "err", err)
+		os.Exit(1)
+	}
+	reg := metrics.New()
+	cacheOn := envBool("CACHE_ENABLED", true)
+	cacheTTL := time.Duration(envInt("CACHE_TTL_SECONDS", 300)) * time.Second
+	log.Info("cache settings", "enabled", cacheOn, "ttl", cacheTTL.String())
+	for m := range provider.Pricing { // so the dollars-saved panel starts at 0
+		reg.Inc(`cost_saved_usd_total{model="`+m+`"}`, 0)
+	}
 	prov := provider.NewHTTP(env("PROVIDER_URL", "http://localhost:9000"), os.Getenv("PROVIDER_API_KEY"),
 		time.Duration(envInt("PROVIDER_TIMEOUT_MS", 30000))*time.Millisecond)
-	reg := metrics.New()
 	q, pacer, err := newQueue(log, rdb, prov, reg)
 	if err != nil {
 		log.Error("queue config", "err", err)
@@ -73,9 +86,10 @@ func main() {
 	}
 	s := &server{
 		limiter:  limiter,
-		budget:   budget.NewMemory(envFloat("TEAM_BUDGET_USD", 0)),
-		cache:    respCache,
-		cacheTTL: time.Duration(envInt("CACHE_TTL_SECONDS", 300)) * time.Second,
+		budget:   budgets,
+		cache:    cache.NewInstrumented(respCache, reg),
+		cacheOn:  cacheOn,
+		cacheTTL: cacheTTL,
 		router:   router.LengthRouter{MaxCheapChars: envInt("ROUTER_MAX_CHEAP_CHARS", 500)},
 		provider: prov,
 		queue:    q,
@@ -144,29 +158,43 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusTooManyRequests, "rate_limited", "rate limit exceeded")
 		return
 	}
-	// 2. Budget
-	if ok, err := s.budget.Check(ctx, team); err == nil && !ok {
-		s.metrics.Inc(`requests_total{result="budget_exceeded"}`, 1)
-		writeErr(w, http.StatusPaymentRequired, "budget_exceeded", "team budget exhausted")
-		return
-	}
-	// 3. Route, then cache lookup (key includes the chosen model)
+	// 2. Route, then cache lookup (key includes the chosen model)
 	model := s.router.Route(&req)
 	ckey := cache.Key(model, req.Messages)
 	cacheStatus := "BYPASS"
-	if !req.NoCache {
-		// A cache error (Redis slow/down) is counted and treated as a miss:
-		// the cache never fails a request.
+	useCache := s.cacheOn && !req.NoCache
+	if useCache {
+		// A cache error (Redis slow/down) is treated as a miss: the cache
+		// never fails a request. s.cache (Instrumented) counts hits, misses,
+		// errors and lookup latency.
 		resp, hit, err := s.cache.Get(ctx, ckey)
 		if err != nil {
-			s.metrics.Inc(`cache_errors_total{op="get"}`, 1)
 			s.log.Warn("cache get error", "request_id", reqID, "err", err)
 		}
 		if hit {
-			s.finish(w, reqID, key, team, model, "HIT", resp, 0, start)
+			// The hit cost nothing; what it saved is what the provider
+			// would have charged for the same usage.
+			s.finish(w, reqID, key, team, model, "HIT", resp, 0, provider.Cost(model, resp.Usage), start)
 			return
 		}
 		cacheStatus = "MISS"
+	}
+	// 3. Budget: only requests that will cost money are checked. On a backend
+	// error ok already reflects BUDGET_FAIL_MODE.
+	ok, err := s.budget.Check(ctx, team)
+	if err != nil {
+		s.metrics.Inc("budget_errors_total", 1)
+		s.log.Warn("budget check error", "request_id", reqID, "team", team, "err", err, "allowed", ok)
+		if !ok { // fail closed
+			s.metrics.Inc(`requests_total{result="budget_unavailable"}`, 1)
+			w.Header().Set("Retry-After", "1")
+			writeErr(w, http.StatusServiceUnavailable, "budget_unavailable", "budget service unavailable")
+			return
+		}
+	} else if !ok {
+		s.metrics.Inc(`requests_total{result="budget_exceeded"}`, 1)
+		writeErr(w, http.StatusPaymentRequired, "budget_exceeded", "team budget exhausted")
+		return
 	}
 	// 4. Provider call, through the overflow queue when the provider is at its limit.
 	resp, err := s.callProvider(ctx, reqID, model, &req)
@@ -197,17 +225,16 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cost := provider.Cost(model, resp.Usage)
-	_ = s.budget.Add(ctx, team, cost)
-	if !req.NoCache {
+	s.recordSpend(ctx, reqID, team, cost)
+	if useCache {
 		if err := s.cache.Set(ctx, ckey, resp, s.cacheTTL); err != nil {
-			s.metrics.Inc(`cache_errors_total{op="set"}`, 1)
 			s.log.Warn("cache set error", "request_id", reqID, "err", err)
 		}
 	}
-	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, start)
+	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, 0, start)
 }
 
-func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheStatus string, resp *api.ChatResponse, cost float64, start time.Time) {
+func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheStatus string, resp *api.ChatResponse, cost, saved float64, start time.Time) {
 	lat := time.Since(start)
 	w.Header().Set(api.HeaderCache, cacheStatus)
 	w.Header().Set(api.HeaderModel, model)
@@ -218,9 +245,73 @@ func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheSta
 	s.metrics.Inc(`requests_total{result="ok",cache="`+strings.ToLower(cacheStatus)+`",model="`+model+`"}`, 1)
 	s.metrics.Inc(`cost_usd_total{model="`+model+`"}`, cost)
 	s.metrics.Inc(`tokens_total{model="`+model+`"}`, float64(resp.Usage.TotalTokens))
+	if saved > 0 {
+		s.metrics.Inc(`cost_saved_usd_total{model="`+model+`"}`, saved)
+	}
 	// One structured log line per request (schema: docs/api.md).
 	s.log.Info("request", "request_id", reqID, "api_key", mask(key), "team", team, "model", model,
-		"cache", cacheStatus, "tokens", resp.Usage.TotalTokens, "cost_usd", cost, "latency_ms", lat.Milliseconds())
+		"cache", cacheStatus, "tokens", resp.Usage.TotalTokens, "cost_usd", cost, "cost_saved_usd", saved,
+		"latency_ms", lat.Milliseconds())
+}
+
+// recordSpend charges the team. A failed write is logged with the amount so
+// spend can be reconciled later; it never fails the request (already served).
+func (s *server) recordSpend(ctx context.Context, reqID, team string, cost float64) {
+	if cost <= 0 {
+		return
+	}
+	s.metrics.Inc(`team_spend_usd_total{team="`+team+`"}`, cost)
+	spend, err := s.budget.Add(ctx, team, cost)
+	if err != nil {
+		s.metrics.Inc("budget_errors_total", 1)
+		s.log.Error("budget spend not recorded", "request_id", reqID, "team", team, "cost_usd", cost, "err", err)
+		return
+	}
+	if spend.CrossedAlert {
+		s.metrics.Inc(`budget_alerts_total{team="`+team+`"}`, 1)
+		s.log.Warn("team budget alert", "team", team, "spent_usd", spend.TotalUSD, "limit_usd", spend.LimitUSD)
+	}
+}
+
+// newBudget picks the budget tracker from config:
+//
+//	BUDGET_BACKEND           memory | redis (default: redis if REDIS_ADDR is set, else memory)
+//	TEAM_BUDGET_USD          default monthly cap per team (0 = unlimited)
+//	TEAM_BUDGETS             per-team caps, e.g. "team-a=50,team-b=10"
+//	BUDGET_ALERT_FRACTION    alert when a team passes this share of its cap (default 0.8, 0 = off)
+//	BUDGET_FAIL_MODE         open | closed — behaviour when Redis is unreachable
+//	BUDGET_REDIS_TIMEOUT_MS  per-call budget (default 50)
+func newBudget(log *slog.Logger, client *redis.Client) (budget.Tracker, error) {
+	limits, err := budget.ParseLimits(os.Getenv("TEAM_BUDGETS"),
+		envFloat("TEAM_BUDGET_USD", 0), envFloat("BUDGET_ALERT_FRACTION", 0.8))
+	if err != nil {
+		return nil, err
+	}
+	backend := os.Getenv("BUDGET_BACKEND")
+	if backend == "" {
+		backend = "memory"
+		if client != nil {
+			backend = "redis"
+		}
+	}
+	switch backend {
+	case "memory":
+		log.Info("budget", "backend", "memory", "default_usd", limits.Default, "teams", len(limits.PerTeam))
+		return budget.NewMemory(limits), nil
+	case "redis":
+		if client == nil {
+			return nil, errors.New("BUDGET_BACKEND=redis requires REDIS_ADDR")
+		}
+		mode, err := budget.ParseFailMode(os.Getenv("BUDGET_FAIL_MODE"))
+		if err != nil {
+			return nil, err
+		}
+		timeout := time.Duration(envInt("BUDGET_REDIS_TIMEOUT_MS", 50)) * time.Millisecond
+		log.Info("budget", "backend", "redis", "default_usd", limits.Default, "teams", len(limits.PerTeam),
+			"fail_mode", os.Getenv("BUDGET_FAIL_MODE"), "timeout", timeout.String())
+		return budget.NewRedis(client, limits, budget.WithFailMode(mode), budget.WithTimeout(timeout)), nil
+	}
+	return nil, fmt.Errorf("unknown BUDGET_BACKEND %q (want memory|redis)", backend)
 }
 
 // callProvider calls the provider directly while the shared provider rate
@@ -435,6 +526,13 @@ func env(k, def string) string {
 
 func envInt(k string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
+		return v
+	}
+	return def
+}
+
+func envBool(k string, def bool) bool {
+	if v, err := strconv.ParseBool(os.Getenv(k)); err == nil {
 		return v
 	}
 	return def
