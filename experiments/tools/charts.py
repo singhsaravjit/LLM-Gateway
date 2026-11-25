@@ -66,7 +66,7 @@ def exp3():
         hi = [max(float(r["over_admission_pct"]) for r in by[backend][n]) for n in ns]
         ax.errorbar(ns, means, yerr=[[m - l for m, l in zip(means, lo)], [h - m for m, h in zip(means, hi)]],
                     color=color, marker=marker, markersize=6, linestyle=ls, capsize=3, elinewidth=1)
-        label_end(ax, ns[-1], means[-1], f"{name}  {means[-1]:+.0f}%")
+        label_end(ax, ns[-1], means[-1], f"{name}  {round(means[-1]) or 0:+d}%", dy=9 if backend == "redis" else 0)
     ax.axhline(0, color=TEXT2, linewidth=0.8)
     ax.set_xscale("log", base=2)
     ax.set_xticks([1, 2, 4, 8], ["1", "2", "4", "8"])
