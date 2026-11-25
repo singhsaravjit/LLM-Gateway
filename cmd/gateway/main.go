@@ -36,6 +36,7 @@ type server struct {
 	limiter  ratelimit.Limiter
 	budget   budget.Tracker
 	cache    cache.Cache
+	cacheOn  bool // CACHE_ENABLED; false skips the cache for every request
 	cacheTTL time.Duration
 	router   router.Router
 	provider provider.Client
@@ -66,15 +67,23 @@ func main() {
 		log.Error("budget config", "err", err)
 		os.Exit(1)
 	}
+	reg := metrics.New()
+	cacheOn := envBool("CACHE_ENABLED", true)
+	cacheTTL := time.Duration(envInt("CACHE_TTL_SECONDS", 300)) * time.Second
+	log.Info("cache settings", "enabled", cacheOn, "ttl", cacheTTL.String())
+	for m := range provider.Pricing { // so the dollars-saved panel starts at 0
+		reg.Inc(`cost_saved_usd_total{model="`+m+`"}`, 0)
+	}
 	s := &server{
 		limiter:  limiter,
 		budget:   budgets,
-		cache:    respCache,
-		cacheTTL: time.Duration(envInt("CACHE_TTL_SECONDS", 300)) * time.Second,
+		cache:    cache.NewInstrumented(respCache, reg),
+		cacheOn:  cacheOn,
+		cacheTTL: cacheTTL,
 		router:   router.LengthRouter{MaxCheapChars: envInt("ROUTER_MAX_CHEAP_CHARS", 500)},
 		provider: provider.NewHTTP(env("PROVIDER_URL", "http://localhost:9000"), os.Getenv("PROVIDER_API_KEY"),
 			time.Duration(envInt("PROVIDER_TIMEOUT_MS", 30000))*time.Millisecond),
-		metrics: metrics.New(),
+		metrics: reg,
 		log:     log,
 	}
 
@@ -139,16 +148,19 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	model := s.router.Route(&req)
 	ckey := cache.Key(model, req.Messages)
 	cacheStatus := "BYPASS"
-	if !req.NoCache {
-		// A cache error (Redis slow/down) is counted and treated as a miss:
-		// the cache never fails a request.
+	useCache := s.cacheOn && !req.NoCache
+	if useCache {
+		// A cache error (Redis slow/down) is treated as a miss: the cache
+		// never fails a request. s.cache (Instrumented) counts hits, misses,
+		// errors and lookup latency.
 		resp, hit, err := s.cache.Get(ctx, ckey)
 		if err != nil {
-			s.metrics.Inc(`cache_errors_total{op="get"}`, 1)
 			s.log.Warn("cache get error", "request_id", reqID, "err", err)
 		}
 		if hit {
-			s.finish(w, reqID, key, team, model, "HIT", resp, 0, start)
+			// The hit cost nothing; what it saved is what the provider
+			// would have charged for the same usage.
+			s.finish(w, reqID, key, team, model, "HIT", resp, 0, provider.Cost(model, resp.Usage), start)
 			return
 		}
 		cacheStatus = "MISS"
@@ -186,16 +198,15 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	cost := provider.Cost(model, resp.Usage)
 	s.recordSpend(ctx, reqID, team, cost)
-	if !req.NoCache {
+	if useCache {
 		if err := s.cache.Set(ctx, ckey, resp, s.cacheTTL); err != nil {
-			s.metrics.Inc(`cache_errors_total{op="set"}`, 1)
 			s.log.Warn("cache set error", "request_id", reqID, "err", err)
 		}
 	}
-	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, start)
+	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, 0, start)
 }
 
-func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheStatus string, resp *api.ChatResponse, cost float64, start time.Time) {
+func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheStatus string, resp *api.ChatResponse, cost, saved float64, start time.Time) {
 	lat := time.Since(start)
 	w.Header().Set(api.HeaderCache, cacheStatus)
 	w.Header().Set(api.HeaderModel, model)
@@ -206,9 +217,13 @@ func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheSta
 	s.metrics.Inc(`requests_total{result="ok",cache="`+strings.ToLower(cacheStatus)+`",model="`+model+`"}`, 1)
 	s.metrics.Inc(`cost_usd_total{model="`+model+`"}`, cost)
 	s.metrics.Inc(`tokens_total{model="`+model+`"}`, float64(resp.Usage.TotalTokens))
+	if saved > 0 {
+		s.metrics.Inc(`cost_saved_usd_total{model="`+model+`"}`, saved)
+	}
 	// One structured log line per request (schema: docs/api.md).
 	s.log.Info("request", "request_id", reqID, "api_key", mask(key), "team", team, "model", model,
-		"cache", cacheStatus, "tokens", resp.Usage.TotalTokens, "cost_usd", cost, "latency_ms", lat.Milliseconds())
+		"cache", cacheStatus, "tokens", resp.Usage.TotalTokens, "cost_usd", cost, "cost_saved_usd", saved,
+		"latency_ms", lat.Milliseconds())
 }
 
 // recordSpend charges the team. A failed write is logged with the amount so
@@ -378,6 +393,13 @@ func env(k, def string) string {
 
 func envInt(k string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
+		return v
+	}
+	return def
+}
+
+func envBool(k string, def bool) bool {
+	if v, err := strconv.ParseBool(os.Getenv(k)); err == nil {
 		return v
 	}
 	return def
