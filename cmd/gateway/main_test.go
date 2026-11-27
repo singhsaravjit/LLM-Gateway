@@ -196,3 +196,85 @@ func TestQueueErrorsMapToStatus(t *testing.T) {
 		}
 	}
 }
+
+type errProvider struct{ err error }
+
+func (p errProvider) Complete(context.Context, string, *api.ChatRequest) (*api.ChatResponse, error) {
+	return nil, p.err
+}
+
+// slowProvider never answers; it only returns when the context is done.
+type slowProvider struct{}
+
+func (slowProvider) Complete(ctx context.Context, _ string, _ *api.ChatRequest) (*api.ChatResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestBadRequests(t *testing.T) {
+	s, p := newTestServer(true)
+	for _, tc := range []struct {
+		name, auth, body string
+		code             int
+	}{
+		{"missing key", "", `{"messages":[{"role":"user","content":"hi"}]}`, http.StatusUnauthorized},
+		{"invalid json", "Bearer k", `{"messages":`, http.StatusBadRequest},
+		{"no messages", "Bearer k", `{"messages":[]}`, http.StatusBadRequest},
+	} {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+		if tc.auth != "" {
+			r.Header.Set(api.HeaderAPIKey, tc.auth)
+		}
+		w := httptest.NewRecorder()
+		s.handleChat(w, r)
+		if w.Code != tc.code {
+			t.Errorf("%s: status %d, want %d", tc.name, w.Code, tc.code)
+		}
+		if !strings.Contains(w.Body.String(), `"bad_request"`) {
+			t.Errorf("%s: body %s, want a bad_request error", tc.name, w.Body.String())
+		}
+	}
+	if n := p.calls.Load(); n != 0 {
+		t.Errorf("provider calls = %d, want 0", n)
+	}
+}
+
+// Upstream 429 is passed through as 429; any other provider failure is 502.
+// A failed request must not be cached.
+func TestUpstreamErrorsMapToStatus(t *testing.T) {
+	for _, tc := range []struct {
+		upstream, want int
+	}{
+		{http.StatusTooManyRequests, http.StatusTooManyRequests},
+		{http.StatusInternalServerError, http.StatusBadGateway},
+	} {
+		s, _ := newTestServer(true)
+		s.provider = errProvider{&provider.StatusError{Code: tc.upstream, Body: "boom"}}
+		w := sendPrompt(s, "t", "x")
+		if w.Code != tc.want {
+			t.Errorf("upstream %d: status %d, want %d", tc.upstream, w.Code, tc.want)
+		}
+		if !strings.Contains(w.Body.String(), `"upstream_error"`) {
+			t.Errorf("upstream %d: body %s, want an upstream_error", tc.upstream, w.Body.String())
+		}
+		ok := &fakeProvider{}
+		s.provider = ok
+		if w := sendPrompt(s, "t", "x"); w.Header().Get(api.HeaderCache) != "MISS" || ok.calls.Load() != 1 {
+			t.Errorf("upstream %d: the failed response was cached", tc.upstream)
+		}
+	}
+}
+
+func TestProviderCallTimesOut(t *testing.T) {
+	s, _ := newTestServer(false)
+	s.provider = slowProvider{}
+	s.reqTimeout = 50 * time.Millisecond
+	start := time.Now()
+	w := sendPrompt(s, "t", "x")
+	if w.Code != http.StatusBadGateway {
+		t.Errorf("status %d, want 502", w.Code)
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("request took %v, the timeout did not fire", d)
+	}
+}

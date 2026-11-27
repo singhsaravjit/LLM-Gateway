@@ -57,7 +57,9 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 
 ## Environment variables (gateway)
 
-`PORT`, `PROVIDER_URL`, `PROVIDER_API_KEY`, `PROVIDER_TIMEOUT_MS`, `REDIS_ADDR`,
+`PORT`, `PROVIDER_URL`, `PROVIDER_API_KEY`, `PROVIDER_TIMEOUT_MS` (one provider attempt, default 30000),
+`REQUEST_TIMEOUT_MS` (whole direct provider step, default 60000, must be >= `PROVIDER_TIMEOUT_MS`),
+`SHUTDOWN_TIMEOUT_MS` (time to drain in-flight requests on SIGTERM, default 20000), `REDIS_ADDR`,
 `RATE_LIMIT_PER_MIN`, `RATE_LIMIT_BURST`, `RATELIMIT_BACKEND` (`local`|`redis`, default `redis` when `REDIS_ADDR` is set),
 `RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD` (default monthly cap, 0 = unlimited), `TEAM_BUDGETS` (`team-a=50,team-b=10`),
 `BUDGET_BACKEND` (`memory`|`redis`), `BUDGET_ALERT_FRACTION` (default 0.8), `BUDGET_FAIL_MODE` (`open`|`closed`),

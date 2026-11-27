@@ -16,8 +16,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/singhsaravjit/llm-gateway/internal/api"
@@ -34,21 +36,27 @@ import (
 )
 
 type server struct {
-	limiter  ratelimit.Limiter
-	budget   budget.Tracker
-	cache    cache.Cache
-	cacheOn  bool // CACHE_ENABLED; false skips the cache for every request
-	cacheTTL time.Duration
-	router   router.Router
-	provider provider.Client
-	queue    queue.Queue // nil when QUEUE_ENABLED=false
-	pacer    queue.Pacer
-	metrics  *metrics.Registry
-	log      *slog.Logger
+	limiter    ratelimit.Limiter
+	budget     budget.Tracker
+	cache      cache.Cache
+	cacheOn    bool // CACHE_ENABLED; false skips the cache for every request
+	cacheTTL   time.Duration
+	reqTimeout time.Duration // REQUEST_TIMEOUT_MS for direct provider calls; 0 = no limit
+	router     router.Router
+	provider   provider.Client
+	queue      queue.Queue // nil when QUEUE_ENABLED=false
+	pacer      queue.Pacer
+	metrics    *metrics.Registry
+	log        *slog.Logger
 }
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Error("invalid config", "err", err)
+		os.Exit(1)
+	}
 	// One Redis client shared by every Redis-backed component (nil without REDIS_ADDR).
 	rdb, err := newRedis(log)
 	if err != nil {
@@ -71,31 +79,29 @@ func main() {
 		os.Exit(1)
 	}
 	reg := metrics.New()
-	cacheOn := envBool("CACHE_ENABLED", true)
-	cacheTTL := time.Duration(envInt("CACHE_TTL_SECONDS", 300)) * time.Second
-	log.Info("cache settings", "enabled", cacheOn, "ttl", cacheTTL.String())
+	log.Info("cache settings", "enabled", cfg.CacheEnabled, "ttl", cfg.CacheTTL.String())
 	for m := range provider.Pricing { // so the dollars-saved panel starts at 0
 		reg.Inc(`cost_saved_usd_total{model="`+m+`"}`, 0)
 	}
-	prov := provider.NewHTTP(env("PROVIDER_URL", "http://localhost:9000"), os.Getenv("PROVIDER_API_KEY"),
-		time.Duration(envInt("PROVIDER_TIMEOUT_MS", 30000))*time.Millisecond)
+	prov := provider.NewHTTP(cfg.ProviderURL, cfg.ProviderAPIKey, cfg.ProviderTimeout)
 	q, pacer, err := newQueue(log, rdb, prov, reg)
 	if err != nil {
 		log.Error("queue config", "err", err)
 		os.Exit(1)
 	}
 	s := &server{
-		limiter:  limiter,
-		budget:   budgets,
-		cache:    cache.NewInstrumented(respCache, reg),
-		cacheOn:  cacheOn,
-		cacheTTL: cacheTTL,
-		router:   router.LengthRouter{MaxCheapChars: envInt("ROUTER_MAX_CHEAP_CHARS", 500)},
-		provider: prov,
-		queue:    q,
-		pacer:    pacer,
-		metrics:  reg,
-		log:      log,
+		limiter:    limiter,
+		budget:     budgets,
+		cache:      cache.NewInstrumented(respCache, reg),
+		cacheOn:    cfg.CacheEnabled,
+		cacheTTL:   cfg.CacheTTL,
+		reqTimeout: cfg.RequestTimeout,
+		router:     router.LengthRouter{MaxCheapChars: cfg.MaxCheapChars},
+		provider:   prov,
+		queue:      q,
+		pacer:      pacer,
+		metrics:    reg,
+		log:        log,
 	}
 	if q != nil {
 		go s.reportQueueDepth()
@@ -106,13 +112,32 @@ func main() {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	mux.Handle("GET /metrics", s.metrics.Handler())
 
-	addr := ":" + env("PORT", "8080")
+	addr := ":" + cfg.Port
 	log.Info("gateway listening", "addr", addr)
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	if err := srv.ListenAndServe(); err != nil {
+
+	// ECS sends SIGTERM when a task is replaced; Ctrl+C sends an interrupt locally.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+	select {
+	case err := <-errCh:
 		log.Error("server stopped", "err", err)
 		os.Exit(1)
+	case <-ctx.Done():
 	}
+
+	// Stop accepting new connections and wait for in-flight requests to finish.
+	log.Info("shutting down", "drain_timeout", cfg.ShutdownTimeout.String())
+	sctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	err = srv.Shutdown(sctx)
+	cancel()
+	if err != nil {
+		log.Error("shutdown timed out, some requests were cut off", "err", err)
+		os.Exit(1)
+	}
+	log.Info("gateway stopped")
 }
 
 func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -323,10 +348,10 @@ func newBudget(log *slog.Logger, client *redis.Client) (budget.Tracker, error) {
 // every request goes straight to the provider and 429s reach the client.
 func (s *server) callProvider(ctx context.Context, reqID, model string, req *api.ChatRequest) (*api.ChatResponse, error) {
 	if s.queue == nil {
-		return s.provider.Complete(ctx, model, req)
+		return s.complete(ctx, model, req)
 	}
 	if s.pacer.TryAcquire(ctx, model) {
-		resp, err := s.provider.Complete(ctx, model, req)
+		resp, err := s.complete(ctx, model, req)
 		if !queue.IsRateLimited(err) {
 			return resp, err
 		}
@@ -336,9 +361,20 @@ func (s *server) callProvider(ctx context.Context, reqID, model string, req *api
 	if errors.Is(err, queue.ErrUnavailable) { // Redis down: fail open, call the provider directly
 		s.metrics.Inc("queue_errors_total", 1)
 		s.log.Warn("queue unavailable, calling provider directly", "request_id", reqID, "err", err)
-		return s.provider.Complete(ctx, model, req)
+		return s.complete(ctx, model, req)
 	}
 	return resp, err
+}
+
+// complete calls the provider directly with a per-request timeout. Queued
+// requests are bounded by QUEUE_WAIT_TIMEOUT_MS instead.
+func (s *server) complete(ctx context.Context, model string, req *api.ChatRequest) (*api.ChatResponse, error) {
+	if s.reqTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.reqTimeout)
+		defer cancel()
+	}
+	return s.provider.Complete(ctx, model, req)
 }
 
 func (s *server) reportQueueDepth() {
@@ -529,13 +565,6 @@ func env(k, def string) string {
 
 func envInt(k string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
-		return v
-	}
-	return def
-}
-
-func envBool(k string, def bool) bool {
-	if v, err := strconv.ParseBool(os.Getenv(k)); err == nil {
 		return v
 	}
 	return def
