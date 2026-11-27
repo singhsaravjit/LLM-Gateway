@@ -1,5 +1,5 @@
 fault,fail_mode,sent,admitted,allowed_by_limit,let_through_during_fault,rejected_503,rejected_429,p99_ms,max_latency_ms
-down,open,2000,1040,410,749,0,960,77,84
-down,closed,2000,262,410,0,778,960,26,55
-hang,open,2000,1019,410,750,0,981,77,79
-hang,closed,2000,268,410,1,752,980,29,76
+down,open,2000,1043,410,750,0,957,27,143
+down,closed,2000,263,410,1,780,957,27,46
+hang,open,2000,1019,410,750,0,981,77,81
+hang,closed,2000,268,410,1,753,979,31,55

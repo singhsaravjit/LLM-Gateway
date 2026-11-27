@@ -1,7 +1,9 @@
 # Experiment 4 (stretch) — Redis failure: fail open vs fail closed
 
 Owner: Saravjit · Issue #19 · Course concept: **CAP and partitions**, **failure models**
-Status: **preliminary, local** (Nov 25), 1 run per case.
+Status: **preliminary, local**, 1 run per case. First run Nov 25; re-run Nov 27
+after #44 (go-redis retries off) to confirm finding 4's fix. Tables below are the
+re-run; the first run is kept in `results/before-44/`.
 
 ## Question
 When the shared rate-limit state (Redis) becomes unreachable, the limiter must
@@ -26,12 +28,14 @@ Reproduce (local only; it restarts the Redis it points at):
 ## Results
 | Fault | Fail mode | Admitted (of 2,000) | Allowed by the limit | Let through during the 15 s fault | 503 | 429 | p99 | Max latency |
 |---|---|---|---|---|---|---|---|---|
-| down | **open** | 1,040 | 410 | **749 of 750** | 0 | 960 | 77 ms | 84 ms |
-| down | **closed** | 262 | 410 | 0 | **778** | 960 | 26 ms | 55 ms |
-| hang | **open** | 1,019 | 410 | **750 of 750** | 0 | 981 | 77 ms | 79 ms |
-| hang | **closed** | 268 | 410 | 1 | **752** | 980 | 29 ms | 76 ms |
+| down | **open** | 1,043 | 410 | **750 of 750** | 0 | 957 | 27 ms | 143 ms¹ |
+| down | **closed** | 263 | 410 | 1 | **780** | 957 | 27 ms | 46 ms |
+| hang | **open** | 1,019 | 410 | **750 of 750** | 0 | 981 | 77 ms | 81 ms |
+| hang | **closed** | 268 | 410 | 1 | **753** | 979 | 31 ms | 55 ms |
 
-Per second, at the edges of the fault (admitted / 429 / 503):
+¹ One request at t = 14.3 s; the next slowest took 64 ms, and p99 during the fault was 29 ms.
+
+Per second, at the edges of the fault, first run (admitted / 429 / 503; the re-run matched within a few requests):
 
 | t (s) | down · open | down · closed | hang · open | hang · closed |
 |---|---|---|---|---|
@@ -59,12 +63,21 @@ Per second, at the edges of the fault (admitted / 429 / 503):
    request took 79 ms. Without the context deadlines from the shared client (#35)
    a call would block for go-redis's 3 s read timeout. Fail-open p99 rose from
    ~26 ms to 77 ms because each request spends up to the 50 ms budget before giving up.
-4. **Found: a refused connection is not "fast".** In the *down* case requests
-   also waited ~50 ms (p99 77 ms) even though the connection was refused at once.
-   The likely cause (not yet confirmed) is go-redis retrying failed commands
-   (default 3 retries with backoff) until the deadline. Setting `MaxRetries` lower for the limiter, or a circuit breaker
-   that skips Redis for a moment after repeated failures, would make the down
-   case fail in ~1 ms. Worth a small follow-up with Dinesh (`internal/redisx`).
+4. **Found and fixed: a refused connection was not "fast".** In the first run,
+   requests in the *down* case also waited ~50 ms (p99 77 ms) even though the
+   connection was refused at once, because go-redis retried failed commands
+   (default 3 retries with backoff) until the deadline. Dinesh turned retries off
+   in the shared client (#44). Re-run on the same setup:
+
+   | Down, fail open | p99 (whole run) | Max |
+   |---|---|---|
+   | Before #44 | 77 ms | 84 ms |
+   | **After #44** | **27 ms** (same as with Redis healthy) | 143 ms (one outlier; next 64 ms) |
+
+   A refused connection now fails at once. A *hung* Redis is unchanged (p99 77 ms)
+   because there is nothing to refuse: each request still waits out the 50 ms
+   budget. A circuit breaker that skips Redis briefly after repeated timeouts
+   would fix that case too.
 
 ## Which mode should the gateway use?
 It depends on what the limit protects:
@@ -83,4 +96,5 @@ It depends on what the limit protects:
 
 ## Left to do
 - [ ] 3 runs per case; on ECS with a security-group block (needs #21).
-- [ ] Try the `MaxRetries` / short-circuit change and re-measure the *down* case.
+- [x] Re-measure the *down* case with go-redis retries off (#44): p99 77 → 27 ms.
+- [ ] Optional: a short-circuit (breaker) for the *hang* case, then re-measure.
