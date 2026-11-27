@@ -368,6 +368,48 @@
           "legendFormat": "{{op}}"
         }
       ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Coalesced requests per second",
+      "description": "Requests that waited for an identical in-flight request instead of calling the provider (CACHE_COALESCE), and waiters that gave up and called it themselves.",
+      "gridPos": {
+        "x": 0,
+        "y": 21,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "fillOpacity": 10
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        },
+        "tooltip": {
+          "mode": "multi"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (level) (rate(llmgw_cache_coalesced_total[1m]))",
+          "legendFormat": "coalesced {{level}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(llmgw_cache_coalesce_fallback_total[1m]))",
+          "legendFormat": "fallback"
+        }
+      ]
     }
   ]
 }
