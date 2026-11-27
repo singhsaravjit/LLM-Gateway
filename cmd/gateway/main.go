@@ -84,7 +84,14 @@ func main() {
 	for m := range provider.Pricing { // so the dollars-saved panel starts at 0
 		reg.Inc(`cost_saved_usd_total{model="`+m+`"}`, 0)
 	}
-	prov := provider.NewHTTP(cfg.ProviderURL, cfg.ProviderAPIKey, cfg.ProviderTimeout)
+	// One Resilient client shared by the direct path and the queue workers, so
+	// both get retries, breakers and fallback.
+	prov := provider.NewResilient(provider.NewHTTP(cfg.ProviderURL, cfg.ProviderAPIKey, cfg.ProviderTimeout),
+		provider.ResilientConfig{MaxAttempts: cfg.RetryAttempts, BaseBackoff: cfg.RetryBase, MaxBackoff: cfg.RetryMax,
+			BreakerFailures: cfg.BreakerFailures, BreakerOpenFor: cfg.BreakerOpen, Fallback: cfg.FallbackEnabled}, reg)
+	log.Info("provider resilience", "attempts", cfg.RetryAttempts, "base_backoff", cfg.RetryBase.String(),
+		"max_backoff", cfg.RetryMax.String(), "breaker_failures", cfg.BreakerFailures,
+		"breaker_open", cfg.BreakerOpen.String(), "fallback", cfg.FallbackEnabled)
 	q, pacer, err := newQueue(log, rdb, prov, reg)
 	if err != nil {
 		log.Error("queue config", "err", err)
@@ -238,7 +245,10 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	// in the cache.
 	fetch := func(fctx context.Context) (*api.ChatResponse, error) {
 		resp, err := s.callProvider(fctx, reqID, model, &req)
-		if err == nil && useCache {
+		// A fallback answer is not what the routed model would have said, so it
+		// is not cached under that model's key (other nodes' waiters then fetch
+		// for themselves once their wait runs out).
+		if err == nil && useCache && modelUsed(model, resp) == model {
 			if err := s.cache.Set(fctx, ckey, resp, s.cacheTTL); err != nil {
 				s.log.Warn("cache set error", "request_id", reqID, "err", err)
 			}
@@ -278,14 +288,29 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, status, "upstream_error", "provider request failed")
 		return
 	}
+	// Local waiters share the leader's resp, so they see the fallback too.
+	used := modelUsed(model, resp)
+	if used != model {
+		s.log.Info("served by fallback model", "request_id", reqID, "routed", model, "used", used)
+	}
 	if outcome != cache.Fetched {
 		// Another request paid for this answer; this one waited for it.
-		s.finish(w, reqID, key, team, model, "COALESCED", resp, 0, provider.Cost(model, resp.Usage), start)
+		s.finish(w, reqID, key, team, used, "COALESCED", resp, 0, provider.Cost(used, resp.Usage), start)
 		return
 	}
-	cost := provider.Cost(model, resp.Usage)
+	cost := provider.Cost(used, resp.Usage)
 	s.recordSpend(ctx, reqID, team, cost)
-	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, 0, start)
+	s.finish(w, reqID, key, team, used, cacheStatus, resp, cost, 0, start)
+}
+
+// modelUsed is the model that actually answered. After a fallback
+// provider.Resilient sets resp.Model to the other model of the cheap/strong
+// pair; this also works for queued requests since resp.Model is in the JSON.
+func modelUsed(routed string, resp *api.ChatResponse) string {
+	if other, ok := provider.FallbackModel(routed); ok && resp.Model == other {
+		return other
+	}
+	return routed
 }
 
 func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheStatus string, resp *api.ChatResponse, cost, saved float64, start time.Time) {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -270,6 +271,131 @@ func TestUpstreamErrorsMapToStatus(t *testing.T) {
 		if w := sendPrompt(s, "t", "x"); w.Header().Get(api.HeaderCache) != "MISS" || ok.calls.Load() != 1 {
 			t.Errorf("upstream %d: the failed response was cached", tc.upstream)
 		}
+	}
+}
+
+// downProvider answers 500 for the models in down and works for the rest.
+type downProvider struct {
+	down  map[string]bool
+	calls atomic.Int32
+	delay time.Duration
+}
+
+func (p *downProvider) Complete(_ context.Context, model string, _ *api.ChatRequest) (*api.ChatResponse, error) {
+	p.calls.Add(1)
+	time.Sleep(p.delay)
+	if p.down[model] {
+		return nil, &provider.StatusError{Code: 500, Body: "down"}
+	}
+	return &api.ChatResponse{ID: "x", Model: "real-" + model, Usage: testUsage}, nil
+}
+
+func resilientFor(s *server, down ...string) *downProvider {
+	p := &downProvider{down: map[string]bool{}}
+	for _, m := range down {
+		p.down[m] = true
+	}
+	cfg := provider.DefaultResilientConfig()
+	cfg.BaseBackoff, cfg.MaxBackoff = time.Millisecond, time.Millisecond
+	s.provider = provider.NewResilient(p, cfg, s.metrics)
+	return p
+}
+
+func sendModel(s *server, model string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hello"}]}`))
+	r.Header.Set("Authorization", "Bearer test-key")
+	w := httptest.NewRecorder()
+	s.handleChat(w, r)
+	return w
+}
+
+// strong is down: the request is served by cheap, reported and charged as
+// cheap, and not cached under strong's key (or at all).
+func TestFallbackReportsAndChargesActualModel(t *testing.T) {
+	s, _ := newTestServer(true, cache.CoalesceOff)
+	p := resilientFor(s, "strong")
+	w := sendModel(s, "strong")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get(api.HeaderModel); got != "cheap" {
+		t.Errorf("X-Model-Used=%s, want cheap", got)
+	}
+	want := provider.Cost("cheap", testUsage)
+	if got := w.Header().Get(api.HeaderCostUSD); got != strconv.FormatFloat(want, 'f', 6, 64) {
+		t.Errorf("X-Cost-USD=%s, want %f (cheap price)", got, want)
+	}
+	if got := metric(t, s, `cost_usd_total{model="cheap"}`); got != want {
+		t.Errorf("cost_usd_total{cheap} = %v, want %v", got, want)
+	}
+	if got := metric(t, s, `cost_usd_total{model="strong"}`); got != 0 {
+		t.Errorf("cost_usd_total{strong} = %v, want 0", got)
+	}
+	if got := metric(t, s, `provider_fallbacks_total{from="strong",to="cheap"}`); got != 1 {
+		t.Errorf("fallbacks = %v, want 1", got)
+	}
+	msgs := []api.Message{{Role: "user", Content: "hello"}}
+	for _, m := range []string{"strong", "cheap"} {
+		if _, hit, _ := s.cache.Get(context.Background(), cache.Key(m, msgs, 0)); hit {
+			t.Errorf("fallback response was cached under %s", m)
+		}
+	}
+	// strong is back: the same request must reach the provider, not a cache entry
+	p.down = nil
+	calls := p.calls.Load()
+	w = sendModel(s, "strong")
+	if w.Header().Get(api.HeaderCache) != "MISS" || w.Header().Get(api.HeaderModel) != "strong" || p.calls.Load() != calls+1 {
+		t.Errorf("after recovery: X-Cache=%s X-Model-Used=%s, want MISS strong from the provider",
+			w.Header().Get(api.HeaderCache), w.Header().Get(api.HeaderModel))
+	}
+}
+
+// Coalesced waiters share the leader's fallback answer: all report cheap, only
+// the leader pays (at cheap's price), and nothing is cached.
+func TestCoalescedFallback(t *testing.T) {
+	s, _ := newTestServer(true, cache.CoalesceLocal)
+	p := resilientFor(s, "strong")
+	p.delay = 50 * time.Millisecond
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	got := map[string]int{}
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			w := sendModel(s, "strong")
+			mu.Lock()
+			got[w.Header().Get(api.HeaderCache)+" "+w.Header().Get(api.HeaderModel)]++
+			mu.Unlock()
+		}()
+	}
+	wg.Wait()
+	if got["MISS cheap"] != 1 || got["COALESCED cheap"] != 19 {
+		t.Fatalf("X-Cache/X-Model-Used counts %v, want 1 MISS cheap and 19 COALESCED cheap", got)
+	}
+	cost := provider.Cost("cheap", testUsage)
+	if v := metric(t, s, `cost_usd_total{model="cheap"}`); v != cost {
+		t.Errorf("cost paid = %v, want one cheap call (%v)", v, cost)
+	}
+	if v := metric(t, s, `cost_saved_usd_total{model="cheap"}`); math.Abs(v-19*cost) > 1e-12 {
+		t.Errorf("cost saved = %v, want %v at cheap's price", v, 19*cost)
+	}
+	if v := metric(t, s, `requests_total{result="ok",cache="coalesced",model="strong"}`); v != 0 {
+		t.Errorf("%v coalesced requests reported as strong", v)
+	}
+	msgs := []api.Message{{Role: "user", Content: "hello"}}
+	if _, hit, _ := s.cache.Get(context.Background(), cache.Key("strong", msgs, 0)); hit {
+		t.Error("fallback response was cached under strong")
+	}
+}
+
+func TestBothModelsDownIs502(t *testing.T) {
+	s, _ := newTestServer(true, cache.CoalesceOff)
+	resilientFor(s, "strong", "cheap")
+	w := sendModel(s, "strong")
+	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), `"upstream_error"`) {
+		t.Errorf("status %d %s, want 502 upstream_error", w.Code, w.Body.String())
 	}
 }
 

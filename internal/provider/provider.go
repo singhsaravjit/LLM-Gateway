@@ -1,8 +1,8 @@
 // Package provider — owner: Preshit.
 //
-// HTTP client for LLM providers (the mock, or a real API for the demo).
-// TODO(preshit): retries with exponential backoff + jitter, circuit breaker,
-// fallback to the other model, real-provider adapter for the demo.
+// HTTP client for LLM providers (the mock, or a real API for the demo), and
+// Resilient (resilient.go) which adds retries, circuit breakers and fallback.
+// TODO(preshit): real-provider adapter for the demo.
 package provider
 
 import (
