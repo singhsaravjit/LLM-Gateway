@@ -202,7 +202,7 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	// 2. Route, then cache lookup (key includes the chosen model)
 	model := s.router.Route(&req)
-	ckey := cache.Key(model, req.Messages)
+	ckey := cache.Key(model, req.Messages, req.MaxTokens)
 	cacheStatus := "BYPASS"
 	useCache := s.cacheOn && !req.NoCache
 	if useCache {

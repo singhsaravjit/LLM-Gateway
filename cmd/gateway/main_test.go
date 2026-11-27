@@ -494,3 +494,23 @@ func (q slowQueue) Submit(context.Context, string, *api.ChatRequest) (*api.ChatR
 }
 func (slowQueue) Depth(context.Context) (int64, error) { return 0, nil }
 func (slowQueue) Close() error                         { return nil }
+
+// A reply cached at a small max_tokens must not answer a request that allows more.
+func TestCacheKeyIncludesMaxTokens(t *testing.T) {
+	s, p := newTestServer(true, cache.CoalesceOff)
+	sendMax := func(n int) string {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+			strings.NewReader(`{"messages":[{"role":"user","content":"hello"}],"max_tokens":`+strconv.Itoa(n)+`}`))
+		r.Header.Set("Authorization", "Bearer test-key")
+		w := httptest.NewRecorder()
+		s.handleChat(w, r)
+		return w.Header().Get(api.HeaderCache)
+	}
+	got := []string{sendMax(50), sendMax(500), sendMax(50)}
+	if want := []string{"MISS", "MISS", "HIT"}; strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("X-Cache = %v, want %v", got, want)
+	}
+	if n := p.calls.Load(); n != 2 {
+		t.Errorf("provider calls = %d, want 2", n)
+	}
+}

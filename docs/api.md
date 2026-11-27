@@ -38,7 +38,7 @@ Other endpoints: `GET /healthz`, `GET /metrics` (Prometheus).
 
 | Key                               | Type   | Owner    | Notes                                  |
 |-----------------------------------|--------|----------|----------------------------------------|
-| `cache:<sha256(model,messages)>`  | string | Dinesh   | JSON `ChatResponse`, TTL = cache TTL   |
+| `cache:<sha256(model,messages,max_tokens)>` | string | Dinesh | JSON `ChatResponse`, TTL = cache TTL; `max_tokens` is left out of the hash when not set |
 | `lock:<cache-key>`                | string | Dinesh   | coalescing lock, short TTL             |
 | `rl:<api-key>`                    | hash   | Saravjit | token bucket `{tokens, ts}`; `ts` is Redis server time (s); auto-expires when full |
 | `rl:provider:<model>`             | hash   | Saravjit | shared provider-side token bucket      |

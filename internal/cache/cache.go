@@ -24,14 +24,16 @@ type Cache interface {
 }
 
 // Key builds the cache key. Format is fixed in docs/api.md: cache:<sha256>.
-// TODO(dinesh): include max_tokens, so a reply cut short at a small limit is
-// not served to a request with a larger one. Changes the key format, so it
-// goes in its own PR reviewed by all owners.
-func Key(model string, msgs []api.Message) string {
+//
+// maxTokens is part of the key, so a reply cut short at a small limit is not
+// served to a request that allows a longer one. It is left out of the hash
+// when 0 (not set), so keys for requests without max_tokens are unchanged.
+func Key(model string, msgs []api.Message, maxTokens int) string {
 	b, _ := json.Marshal(struct {
 		M string        `json:"m"`
 		P []api.Message `json:"p"`
-	}{model, msgs})
+		T int           `json:"t,omitempty"`
+	}{model, msgs, maxTokens})
 	sum := sha256.Sum256(b)
 	return "cache:" + hex.EncodeToString(sum[:])
 }
