@@ -14,6 +14,7 @@ services:
       PROVIDER_RPS: "45"               # just under mockllm's RATE_LIMIT_RPS (50)
       TEAM_BUDGETS: "team-1=5,team-2=5,team-3=5"   # USD/month; Locust uses team-1..3
       CACHE_TTL_SECONDS: "300"
+      CACHE_COALESCE: ${CACHE_COALESCE:-off}   # off | local | redis (Experiment 2, demo)
     depends_on: [mockllm, redis]
     deploy: { replicas: 1 }   # scale with: docker compose up --scale gateway=3 (remove ports mapping first)
 

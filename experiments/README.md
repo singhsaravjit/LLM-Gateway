@@ -29,8 +29,10 @@ Change **one setting at a time** and always compare against the baseline
 
 | # | Status |
 |---|---|
+| 1 | Preliminary results, local (1 run per setting) — [RESULTS](01-caching/RESULTS.md) |
+| 2 | Preliminary results, local (1 burst per setting) — [RESULTS](02-coalescing/RESULTS.md) |
 | 3 | Preliminary results, local (3 repeats) — [RESULTS](03-ratelimit/RESULTS.md) |
 | 4 | Preliminary results, local (1 run per case) — [RESULTS](04-redis-failure/RESULTS.md) |
 | 5 | Preliminary results, local (2 repeats steady, 1 burst) — [RESULTS](05-queueing/RESULTS.md) |
 
-All three are to be repeated on ECS once the AWS stack (#21, #22) is up.
+All of them are to be repeated on ECS once the AWS stack (#21, #22) is up.
