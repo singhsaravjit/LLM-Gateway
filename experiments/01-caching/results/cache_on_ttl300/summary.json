@@ -1,0 +1,40 @@
+{
+  "requests_logged": 4745,
+  "hits": 3913,
+  "misses": 832,
+  "bypass": 0,
+  "hit_rate": 0.8247,
+  "provider_calls": 832,
+  "cache_errors": 0,
+  "cost_paid_usd": 0.443258,
+  "cost_per_1k_requests_usd": 0.0934,
+  "latency_ms": {
+    "MISS": {
+      "p50": 896,
+      "p95": 2497,
+      "p99": 2713,
+      "mean": 1080.4
+    },
+    "HIT": {
+      "p50": 2,
+      "p95": 4,
+      "p99": 6,
+      "mean": 2.0
+    }
+  },
+  "latency_ms_all": {
+    "p50": 2,
+    "p95": 1052,
+    "p99": 2447,
+    "mean": 191.1
+  },
+  "locust": {
+    "requests": 4726,
+    "failures": 0,
+    "rps": 39.6,
+    "p50_ms": 6.0,
+    "p95_ms": 1100.0,
+    "p99_ms": 2400.0,
+    "avg_ms": 195.0
+  }
+}
