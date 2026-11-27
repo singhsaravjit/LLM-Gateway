@@ -337,7 +337,7 @@ func TestFallbackReportsAndChargesActualModel(t *testing.T) {
 	}
 	msgs := []api.Message{{Role: "user", Content: "hello"}}
 	for _, m := range []string{"strong", "cheap"} {
-		if _, hit, _ := s.cache.Get(context.Background(), cache.Key(m, msgs)); hit {
+		if _, hit, _ := s.cache.Get(context.Background(), cache.Key(m, msgs, 0)); hit {
 			t.Errorf("fallback response was cached under %s", m)
 		}
 	}
@@ -385,7 +385,7 @@ func TestCoalescedFallback(t *testing.T) {
 		t.Errorf("%v coalesced requests reported as strong", v)
 	}
 	msgs := []api.Message{{Role: "user", Content: "hello"}}
-	if _, hit, _ := s.cache.Get(context.Background(), cache.Key("strong", msgs)); hit {
+	if _, hit, _ := s.cache.Get(context.Background(), cache.Key("strong", msgs, 0)); hit {
 		t.Error("fallback response was cached under strong")
 	}
 }
