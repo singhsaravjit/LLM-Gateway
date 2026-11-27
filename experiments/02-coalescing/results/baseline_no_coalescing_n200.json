@@ -1,0 +1,12 @@
+{
+  "n": 200,
+  "outcomes": {
+    "200 MISS": 200
+  },
+  "provider_calls": 200,
+  "latency_ms": {
+    "min": 610,
+    "p50": 910,
+    "max": 1219
+  }
+}

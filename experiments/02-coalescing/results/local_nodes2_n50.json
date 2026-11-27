@@ -1,0 +1,14 @@
+{
+  "n": 50,
+  "hosts": 2,
+  "outcomes": {
+    "200 COALESCED": 48,
+    "200 MISS": 2
+  },
+  "provider_calls": 2,
+  "latency_ms": {
+    "min": 1080,
+    "p50": 1087,
+    "max": 1093
+  }
+}
