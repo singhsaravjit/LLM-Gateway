@@ -88,4 +88,4 @@ These panels are in the Grafana dashboard "LLM Gateway: Cache"
 
 Shared Redis client (`internal/redisx`, one pool for all components; unset means go-redis default):
 `REDIS_POOL_SIZE` (default 10 per CPU), `REDIS_DIAL_TIMEOUT_MS` (5000), `REDIS_READ_TIMEOUT_MS` (3000),
-`REDIS_WRITE_TIMEOUT_MS` (same as read). Per-call context timeouts (e.g. `RATELIMIT_REDIS_TIMEOUT_MS`) are honoured.
+`REDIS_WRITE_TIMEOUT_MS` (same as read), `REDIS_MAX_RETRIES` (default 0: a failed command is not retried, so a down Redis fails in about 1 ms and each component's fail-open or fail-closed rule applies at once). Per-call context timeouts (e.g. `RATELIMIT_REDIS_TIMEOUT_MS`) are honoured.
