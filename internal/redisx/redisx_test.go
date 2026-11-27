@@ -115,3 +115,33 @@ func TestContextDeadlineIsHonoured(t *testing.T) {
 		t.Fatalf("ping took %v; context deadline (100ms) was ignored", took)
 	}
 }
+
+// Redis down (connection refused) must fail at once, not wait out the
+// caller's 50 ms budget while go-redis retries.
+func TestRedisDownFailsFast(t *testing.T) {
+	mr := miniredis.RunT(t)
+	addr := mr.Addr()
+	mr.Close()
+	for _, tc := range []struct {
+		retries int
+		fast    bool
+	}{{0, true}, {3, false}} {
+		c := New(Config{Addr: addr, MaxRetries: tc.retries})
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		start := time.Now()
+		err := c.Get(ctx, "k").Err()
+		el := time.Since(start)
+		cancel()
+		c.Close()
+		if err == nil {
+			t.Fatalf("retries=%d: want an error", tc.retries)
+		}
+		if tc.fast && el > 10*time.Millisecond {
+			t.Errorf("retries=%d: took %v, want under 10 ms", tc.retries, el)
+		}
+		if !tc.fast && el < 20*time.Millisecond {
+			t.Errorf("retries=%d: took %v, expected the retries to use most of the 50 ms", tc.retries, el)
+		}
+		t.Logf("retries=%d: failed after %v", tc.retries, el)
+	}
+}

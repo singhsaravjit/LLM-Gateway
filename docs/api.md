@@ -16,7 +16,7 @@ Request headers:
 
 Body: `{"model": "auto|cheap|strong", "messages": [...], "max_tokens": N, "no_cache": false}`
 
-Response headers: `X-Cache: HIT|MISS|BYPASS`, `X-Model-Used`, `X-Cost-USD`, `X-Request-ID`.
+Response headers: `X-Cache: HIT|MISS|BYPASS|COALESCED` (`COALESCED`: waited for an identical request's provider call and paid nothing), `X-Model-Used`, `X-Cost-USD`, `X-Request-ID`.
 
 Error body: `{"error": {"type": "...", "message": "..."}}`
 
@@ -64,6 +64,7 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 `RATELIMIT_FAIL_MODE` (`open`|`closed`, default `open`), `RATELIMIT_REDIS_TIMEOUT_MS` (default 50), `TEAM_BUDGET_USD` (default monthly cap, 0 = unlimited), `TEAM_BUDGETS` (`team-a=50,team-b=10`),
 `BUDGET_BACKEND` (`memory`|`redis`), `BUDGET_ALERT_FRACTION` (default 0.8), `BUDGET_FAIL_MODE` (`open`|`closed`),
 `BUDGET_REDIS_TIMEOUT_MS` (default 50), `CACHE_ENABLED` (default `true`; `false` sends every request to the provider as `BYPASS`), `CACHE_TTL_SECONDS` (default 300),
+`CACHE_COALESCE` (`off`|`local`|`redis`, default `off`; see below), `CACHE_COALESCE_WAIT_MS` (default 5000), `CACHE_COALESCE_POLL_MS` (default 50),
 `CACHE_BACKEND` (`memory`|`redis`, default `redis` when `REDIS_ADDR` is set), `CACHE_REDIS_TIMEOUT_MS` (default 50; a slower lookup counts as a miss),
 `ROUTER_MAX_CHEAP_CHARS`,
 `QUEUE_ENABLED` (default `true`), `QUEUE_BACKEND` (`memory`|`redis`), `QUEUE_MAX` (1000), `QUEUE_WAIT_TIMEOUT_MS` (30000),
@@ -94,6 +95,13 @@ Both the direct path and the queue workers call the provider through `provider.R
 | `breaker_state{model}` | gauge: 0 closed, 1 open, 2 half-open |
 | `breaker_opens_total{model}` | times the breaker opened |
 
+Request coalescing (`CACHE_COALESCE`): on a miss, identical requests that are in flight at the same
+time share one provider call. `local` groups them inside one node; `redis` also takes a `lock:<cache-key>`
+(TTL `REQUEST_TIMEOUT_MS` + 1 s) so only one node in the cluster calls the provider, while the others poll
+the cache. It needs `CACHE_BACKEND=redis` and `CACHE_TTL_SECONDS` > 0. A waiter that times out, or a Redis
+error, means the request calls the provider itself: coalescing can add latency but never fails a request.
+Design: [`docs/design/cache-coalescing.md`](design/cache-coalescing.md).
+
 The cache fails open: if Redis is slow or down, the request is served as a `MISS` from the provider and
 `llmgw_cache_errors_total{op="get"|"set"}` is incremented.
 
@@ -104,7 +112,10 @@ Cache metrics (all prefixed `llmgw_`):
 | `cache_lookups_total{result="hit"\|"miss"\|"error"}` | one per lookup (an error is served as a miss) |
 | `cache_errors_total{op="get"\|"set"}` | Redis slow or down |
 | `cache_lookup_seconds_bucket{le}`, `_sum`, `_count` | lookup latency histogram |
-| `cost_saved_usd_total{model}` | on a hit, what the provider would have charged for the cached response's usage |
+| `cost_saved_usd_total{model}` | on a hit or coalesced request, what the provider would have charged for that response's usage |
+| `cache_coalesced_total{level="local"\|"redis"}` | requests answered by waiting for an identical request on this node (`local`) or another node (`redis`) |
+| `cache_coalesce_fallback_total` | waiters that gave up after `CACHE_COALESCE_WAIT_MS` and called the provider themselves |
+| `cache_errors_total{op="lock"}` | Redis lock errors (the request skips the lock and calls the provider) |
 
 Example queries: hit rate `sum(rate(llmgw_cache_lookups_total{result="hit"}[1m])) / sum(rate(llmgw_cache_lookups_total[1m]))`,
 dollars saved `sum(llmgw_cost_saved_usd_total)`, lookup p95
@@ -114,4 +125,4 @@ These panels are in the Grafana dashboard "LLM Gateway: Cache"
 
 Shared Redis client (`internal/redisx`, one pool for all components; unset means go-redis default):
 `REDIS_POOL_SIZE` (default 10 per CPU), `REDIS_DIAL_TIMEOUT_MS` (5000), `REDIS_READ_TIMEOUT_MS` (3000),
-`REDIS_WRITE_TIMEOUT_MS` (same as read). Per-call context timeouts (e.g. `RATELIMIT_REDIS_TIMEOUT_MS`) are honoured.
+`REDIS_WRITE_TIMEOUT_MS` (same as read), `REDIS_MAX_RETRIES` (default 0: a failed command is not retried, so a down Redis fails in about 1 ms and each component's fail-open or fail-closed rule applies at once). Per-call context timeouts (e.g. `RATELIMIT_REDIS_TIMEOUT_MS`) are honoured.
