@@ -16,8 +16,10 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/singhsaravjit/llm-gateway/internal/api"
@@ -34,21 +36,28 @@ import (
 )
 
 type server struct {
-	limiter  ratelimit.Limiter
-	budget   budget.Tracker
-	cache    cache.Cache
-	cacheOn  bool // CACHE_ENABLED; false skips the cache for every request
-	cacheTTL time.Duration
-	router   router.Router
-	provider provider.Client
-	queue    queue.Queue // nil when QUEUE_ENABLED=false
-	pacer    queue.Pacer
-	metrics  *metrics.Registry
-	log      *slog.Logger
+	limiter    ratelimit.Limiter
+	budget     budget.Tracker
+	cache      cache.Cache
+	cacheOn    bool // CACHE_ENABLED; false skips the cache for every request
+	cacheTTL   time.Duration
+	reqTimeout time.Duration    // REQUEST_TIMEOUT_MS for direct provider calls; 0 = no limit
+	coalesce   *cache.Coalescer // CACHE_COALESCE; groups identical in-flight misses
+	router     router.Router
+	provider   provider.Client
+	queue      queue.Queue // nil when QUEUE_ENABLED=false
+	pacer      queue.Pacer
+	metrics    *metrics.Registry
+	log        *slog.Logger
 }
 
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Error("invalid config", "err", err)
+		os.Exit(1)
+	}
 	// One Redis client shared by every Redis-backed component (nil without REDIS_ADDR).
 	rdb, err := newRedis(log)
 	if err != nil {
@@ -71,31 +80,35 @@ func main() {
 		os.Exit(1)
 	}
 	reg := metrics.New()
-	cacheOn := envBool("CACHE_ENABLED", true)
-	cacheTTL := time.Duration(envInt("CACHE_TTL_SECONDS", 300)) * time.Second
-	log.Info("cache settings", "enabled", cacheOn, "ttl", cacheTTL.String())
+	log.Info("cache settings", "enabled", cfg.CacheEnabled, "ttl", cfg.CacheTTL.String())
 	for m := range provider.Pricing { // so the dollars-saved panel starts at 0
 		reg.Inc(`cost_saved_usd_total{model="`+m+`"}`, 0)
 	}
-	prov := provider.NewHTTP(env("PROVIDER_URL", "http://localhost:9000"), os.Getenv("PROVIDER_API_KEY"),
-		time.Duration(envInt("PROVIDER_TIMEOUT_MS", 30000))*time.Millisecond)
+	prov := provider.NewHTTP(cfg.ProviderURL, cfg.ProviderAPIKey, cfg.ProviderTimeout)
 	q, pacer, err := newQueue(log, rdb, prov, reg)
 	if err != nil {
 		log.Error("queue config", "err", err)
 		os.Exit(1)
 	}
+	coalescer, err := newCoalescer(log, rdb, respCache, reg, cfg)
+	if err != nil {
+		log.Error("coalescing config", "err", err)
+		os.Exit(1)
+	}
 	s := &server{
-		limiter:  limiter,
-		budget:   budgets,
-		cache:    cache.NewInstrumented(respCache, reg),
-		cacheOn:  cacheOn,
-		cacheTTL: cacheTTL,
-		router:   router.LengthRouter{MaxCheapChars: envInt("ROUTER_MAX_CHEAP_CHARS", 500)},
-		provider: prov,
-		queue:    q,
-		pacer:    pacer,
-		metrics:  reg,
-		log:      log,
+		limiter:    limiter,
+		budget:     budgets,
+		cache:      cache.NewInstrumented(respCache, reg),
+		cacheOn:    cfg.CacheEnabled,
+		cacheTTL:   cfg.CacheTTL,
+		reqTimeout: cfg.RequestTimeout,
+		coalesce:   coalescer,
+		router:     router.LengthRouter{MaxCheapChars: cfg.MaxCheapChars},
+		provider:   prov,
+		queue:      q,
+		pacer:      pacer,
+		metrics:    reg,
+		log:        log,
 	}
 	if q != nil {
 		go s.reportQueueDepth()
@@ -106,13 +119,32 @@ func main() {
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	mux.Handle("GET /metrics", s.metrics.Handler())
 
-	addr := ":" + env("PORT", "8080")
+	addr := ":" + cfg.Port
 	log.Info("gateway listening", "addr", addr)
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	if err := srv.ListenAndServe(); err != nil {
+
+	// ECS sends SIGTERM when a task is replaced; Ctrl+C sends an interrupt locally.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ListenAndServe() }()
+	select {
+	case err := <-errCh:
 		log.Error("server stopped", "err", err)
 		os.Exit(1)
+	case <-ctx.Done():
 	}
+
+	// Stop accepting new connections and wait for in-flight requests to finish.
+	log.Info("shutting down", "drain_timeout", cfg.ShutdownTimeout.String())
+	sctx, cancel := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
+	err = srv.Shutdown(sctx)
+	cancel()
+	if err != nil {
+		log.Error("shutdown timed out, some requests were cut off", "err", err)
+		os.Exit(1)
+	}
+	log.Info("gateway stopped")
 }
 
 func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -199,8 +231,27 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusPaymentRequired, "budget_exceeded", "team budget exhausted")
 		return
 	}
-	// 4. Provider call, through the overflow queue when the provider is at its limit.
-	resp, err := s.callProvider(ctx, reqID, model, &req)
+	// 4. Provider call, through the overflow queue when the provider is at
+	// its limit. On a miss it also goes through the coalescer, so identical
+	// requests in flight share one provider call (CACHE_COALESCE). fetch
+	// stores the answer before returning, so waiters on other nodes find it
+	// in the cache.
+	fetch := func(fctx context.Context) (*api.ChatResponse, error) {
+		resp, err := s.callProvider(fctx, reqID, model, &req)
+		if err == nil && useCache {
+			if err := s.cache.Set(fctx, ckey, resp, s.cacheTTL); err != nil {
+				s.log.Warn("cache set error", "request_id", reqID, "err", err)
+			}
+		}
+		return resp, err
+	}
+	var resp *api.ChatResponse
+	outcome := cache.Fetched
+	if useCache {
+		resp, outcome, err = s.coalesce.Do(ctx, ckey, fetch)
+	} else {
+		resp, err = fetch(ctx)
+	}
 	switch {
 	case errors.Is(err, queue.ErrFull):
 		s.metrics.Inc(`requests_total{result="queue_full"}`, 1)
@@ -227,13 +278,13 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, status, "upstream_error", "provider request failed")
 		return
 	}
+	if outcome != cache.Fetched {
+		// Another request paid for this answer; this one waited for it.
+		s.finish(w, reqID, key, team, model, "COALESCED", resp, 0, provider.Cost(model, resp.Usage), start)
+		return
+	}
 	cost := provider.Cost(model, resp.Usage)
 	s.recordSpend(ctx, reqID, team, cost)
-	if useCache {
-		if err := s.cache.Set(ctx, ckey, resp, s.cacheTTL); err != nil {
-			s.log.Warn("cache set error", "request_id", reqID, "err", err)
-		}
-	}
 	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, 0, start)
 }
 
@@ -323,10 +374,10 @@ func newBudget(log *slog.Logger, client *redis.Client) (budget.Tracker, error) {
 // every request goes straight to the provider and 429s reach the client.
 func (s *server) callProvider(ctx context.Context, reqID, model string, req *api.ChatRequest) (*api.ChatResponse, error) {
 	if s.queue == nil {
-		return s.provider.Complete(ctx, model, req)
+		return s.complete(ctx, model, req)
 	}
 	if s.pacer.TryAcquire(ctx, model) {
-		resp, err := s.provider.Complete(ctx, model, req)
+		resp, err := s.complete(ctx, model, req)
 		if !queue.IsRateLimited(err) {
 			return resp, err
 		}
@@ -336,9 +387,20 @@ func (s *server) callProvider(ctx context.Context, reqID, model string, req *api
 	if errors.Is(err, queue.ErrUnavailable) { // Redis down: fail open, call the provider directly
 		s.metrics.Inc("queue_errors_total", 1)
 		s.log.Warn("queue unavailable, calling provider directly", "request_id", reqID, "err", err)
-		return s.provider.Complete(ctx, model, req)
+		return s.complete(ctx, model, req)
 	}
 	return resp, err
+}
+
+// complete calls the provider directly with a per-request timeout. Queued
+// requests are bounded by QUEUE_WAIT_TIMEOUT_MS instead.
+func (s *server) complete(ctx context.Context, model string, req *api.ChatRequest) (*api.ChatResponse, error) {
+	if s.reqTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.reqTimeout)
+		defer cancel()
+	}
+	return s.provider.Complete(ctx, model, req)
 }
 
 func (s *server) reportQueueDepth() {
@@ -484,6 +546,40 @@ func newCache(log *slog.Logger, client *redis.Client) (cache.Cache, error) {
 	return nil, fmt.Errorf("unknown CACHE_BACKEND %q (want memory|redis)", backend)
 }
 
+// newCoalescer picks request coalescing from config:
+//
+//	CACHE_COALESCE          off | local | redis (default off)
+//	                        local: one provider call per key per node (singleflight)
+//	                        redis: one per key per cluster (lock:<key> in Redis); needs CACHE_BACKEND=redis
+//	CACHE_COALESCE_WAIT_MS  how long a waiter polls for another node's answer before calling the provider (default 5000)
+//	CACHE_COALESCE_POLL_MS  poll interval (default 50)
+//
+// The lock TTL is REQUEST_TIMEOUT_MS + 1 s (the longest a direct provider call
+// can take), so a crashed holder frees the key.
+func newCoalescer(log *slog.Logger, client *redis.Client, c cache.Cache, reg *metrics.Registry, cfg config) (*cache.Coalescer, error) {
+	mode, err := cache.ParseCoalesceMode(os.Getenv("CACHE_COALESCE"))
+	if err != nil {
+		return nil, err
+	}
+	if mode != cache.CoalesceRedis {
+		log.Info("coalescing", "mode", mode)
+		return cache.NewCoalescer(mode, c, reg)
+	}
+	if _, ok := c.(*cache.Redis); !ok || client == nil {
+		return nil, errors.New("CACHE_COALESCE=redis requires REDIS_ADDR and the redis cache backend")
+	}
+	if !cfg.CacheEnabled || cfg.CacheTTL <= 0 {
+		return nil, errors.New("CACHE_COALESCE=redis needs the cache on with CACHE_TTL_SECONDS > 0 (waiters read the answer from the cache)")
+	}
+	lockTTL := cfg.RequestTimeout + time.Second // covers a direct provider call with its retries
+	wait := time.Duration(envInt("CACHE_COALESCE_WAIT_MS", 5000)) * time.Millisecond
+	poll := time.Duration(envInt("CACHE_COALESCE_POLL_MS", 50)) * time.Millisecond
+	timeout := time.Duration(envInt("CACHE_REDIS_TIMEOUT_MS", 50)) * time.Millisecond
+	log.Info("coalescing", "mode", mode, "lock_ttl", lockTTL.String(), "wait", wait.String(), "poll", poll.String())
+	return cache.NewCoalescer(mode, c, reg, cache.WithRedisLock(client, lockTTL),
+		cache.WithWait(wait, poll), cache.WithLockTimeout(timeout))
+}
+
 // newRedis builds the shared Redis client from REDIS_* env vars (see
 // internal/redisx). It returns nil when REDIS_ADDR is unset. An unreachable
 // Redis is only a warning: each component has its own failure mode.
@@ -529,13 +625,6 @@ func env(k, def string) string {
 
 func envInt(k string, def int) int {
 	if v, err := strconv.Atoi(os.Getenv(k)); err == nil {
-		return v
-	}
-	return def
-}
-
-func envBool(k string, def bool) bool {
-	if v, err := strconv.ParseBool(os.Getenv(k)); err == nil {
 		return v
 	}
 	return def

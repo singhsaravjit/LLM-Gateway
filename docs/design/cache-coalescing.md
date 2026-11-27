@@ -1,6 +1,6 @@
 # Design notes: request coalescing
 
-Owner: Dinesh · Issues #4 (notes), #13 (build), #15 (Experiment 2) · Status: **notes, to be built in #13**
+Owner: Dinesh · Issues #4 (notes), #13 (build), #15 (Experiment 2) · Status: **built in #13** (`internal/cache/coalesce.go`)
 
 ## The problem
 
@@ -57,7 +57,7 @@ Each node sends at most one lock attempt per key, which keeps Redis traffic smal
 for big bursts.
 
 Config: `CACHE_COALESCE` (`off` | `local` | `redis`), `CACHE_COALESCE_WAIT_MS` (how long
-waiters poll before giving up), lock TTL derived from `PROVIDER_TIMEOUT_MS`.
+waiters poll before giving up), lock TTL derived from `REQUEST_TIMEOUT_MS` (the longest a provider call can take).
 
 Metrics: `cache_coalesced_total{level="local"|"redis"}` (requests answered by waiting),
 `cache_coalesce_fallback_total` (waiters that gave up and called the provider), plus the
