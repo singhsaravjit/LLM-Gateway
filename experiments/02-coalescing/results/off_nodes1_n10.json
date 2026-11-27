@@ -1,0 +1,13 @@
+{
+  "n": 10,
+  "hosts": 1,
+  "outcomes": {
+    "200 MISS": 10
+  },
+  "provider_calls": 10,
+  "latency_ms": {
+    "min": 635,
+    "p50": 797,
+    "max": 1089
+  }
+}

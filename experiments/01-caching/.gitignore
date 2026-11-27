@@ -1,0 +1,2 @@
+# Raw process logs stay local; requests.csv, Locust CSVs and summary.json are the data.
+results/**/*.log

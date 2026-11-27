@@ -1,0 +1,8 @@
+llmgw_cost_usd_total{model="cheap"} 0.16276140000000028
+llmgw_cost_usd_total{model="strong"} 0.4177375000000001
+llmgw_ratelimit_errors_total 1
+llmgw_requests_total{result="ok",cache="miss",model="cheap"} 1725
+llmgw_requests_total{result="ok",cache="miss",model="strong"} 189
+llmgw_requests_total{result="upstream_error"} 13
+llmgw_tokens_total{model="cheap"} 300018
+llmgw_tokens_total{model="strong"} 82489
