@@ -141,7 +141,7 @@ func TestCoalesceRedisAcrossNodes(t *testing.T) {
 	nodeB, _ := NewCoalescer(CoalesceRedis, shared, recB, WithRedisLock(client, 5*time.Second), WithWait(2*time.Second, 10*time.Millisecond))
 
 	var calls atomic.Int32
-	key := Key("cheap", []api.Message{{Role: "user", Content: "hi"}})
+	key := Key("cheap", []api.Message{{Role: "user", Content: "hi"}}, 0)
 	fetch := slowFetch(&calls, shared, key, 200*time.Millisecond)
 	var wg sync.WaitGroup
 	results := make([]map[Outcome]int, 2)

@@ -26,7 +26,7 @@ func sampleResp() *api.ChatResponse {
 }
 
 func testKey() string {
-	return Key("cheap", []api.Message{{Role: "user", Content: "hi"}})
+	return Key("cheap", []api.Message{{Role: "user", Content: "hi"}}, 0)
 }
 
 func TestRedisSetGetRoundTrip(t *testing.T) {
