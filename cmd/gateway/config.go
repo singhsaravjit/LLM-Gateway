@@ -21,6 +21,12 @@ type config struct {
 	MaxCheapChars   int
 	CacheEnabled    bool
 	CacheTTL        time.Duration
+	RetryAttempts   int // attempts per model, including the first
+	RetryBase       time.Duration
+	RetryMax        time.Duration
+	BreakerFailures int
+	BreakerOpen     time.Duration
+	FallbackEnabled bool
 }
 
 func loadConfig() (config, error) {
@@ -38,6 +44,12 @@ func loadConfig() (config, error) {
 		MaxCheapChars:   parseInt("ROUTER_MAX_CHEAP_CHARS", 500, &errs),
 		CacheEnabled:    parseBool("CACHE_ENABLED", true, &errs),
 		CacheTTL:        time.Duration(parseInt("CACHE_TTL_SECONDS", 300, &errs)) * time.Second,
+		RetryAttempts:   parseInt("RETRY_MAX_ATTEMPTS", 3, &errs),
+		RetryBase:       ms("RETRY_BASE_BACKOFF_MS", 100),
+		RetryMax:        ms("RETRY_MAX_BACKOFF_MS", 2000),
+		BreakerFailures: parseInt("BREAKER_FAILURE_THRESHOLD", 5, &errs),
+		BreakerOpen:     ms("BREAKER_OPEN_MS", 10000),
+		FallbackEnabled: parseBool("FALLBACK_ENABLED", true, &errs),
 	}
 	errs = append(errs, c.validate()...)
 	return c, errors.Join(errs...)
@@ -65,6 +77,21 @@ func (c config) validate() []error {
 	}
 	if c.CacheEnabled && c.CacheTTL <= 0 {
 		errs = append(errs, errors.New("CACHE_TTL_SECONDS must be > 0 when the cache is on"))
+	}
+	if c.RetryAttempts < 1 {
+		errs = append(errs, errors.New("RETRY_MAX_ATTEMPTS must be >= 1"))
+	}
+	if c.RetryBase <= 0 {
+		errs = append(errs, errors.New("RETRY_BASE_BACKOFF_MS must be > 0"))
+	}
+	if c.RetryMax < c.RetryBase {
+		errs = append(errs, errors.New("RETRY_MAX_BACKOFF_MS must be >= RETRY_BASE_BACKOFF_MS"))
+	}
+	if c.BreakerFailures < 1 {
+		errs = append(errs, errors.New("BREAKER_FAILURE_THRESHOLD must be >= 1"))
+	}
+	if c.BreakerOpen <= 0 {
+		errs = append(errs, errors.New("BREAKER_OPEN_MS must be > 0"))
 	}
 	return errs
 }

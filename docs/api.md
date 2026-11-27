@@ -68,7 +68,31 @@ Design and rationale: [`docs/design/queue-and-budgets.md`](design/queue-and-budg
 `ROUTER_MAX_CHEAP_CHARS`,
 `QUEUE_ENABLED` (default `true`), `QUEUE_BACKEND` (`memory`|`redis`), `QUEUE_MAX` (1000), `QUEUE_WAIT_TIMEOUT_MS` (30000),
 `QUEUE_WORKERS` (8 per node), `QUEUE_VISIBILITY_TIMEOUT_MS` (wait + 30s), `PROVIDER_RPS` (45; 0 = no pacing),
-`PROVIDER_BURST`, `PROVIDER_RPS_PER_MODEL` (`false`), `NODE_ID`.
+`PROVIDER_BURST`, `PROVIDER_RPS_PER_MODEL` (`false`), `NODE_ID`,
+`RETRY_MAX_ATTEMPTS` (3 attempts per model, including the first), `RETRY_BASE_BACKOFF_MS` (100),
+`RETRY_MAX_BACKOFF_MS` (2000), `BREAKER_FAILURE_THRESHOLD` (5 consecutive failures open a model's breaker),
+`BREAKER_OPEN_MS` (10000, then one probe request is let through), `FALLBACK_ENABLED` (default `true`; `false` for the Experiment 6 baseline).
+
+### Retries, circuit breaker, fallback
+
+Both the direct path and the queue workers call the provider through `provider.Resilient`:
+
+- 5xx, timeouts and connection errors are retried with exponential backoff and full jitter
+  (`rand[0, min(max, base*2^n)]`), never waiting past the request's deadline. 4xx is not retried.
+  A provider 429 is returned unchanged so the overflow queue handles it.
+- Each model has a circuit breaker (closed → open → half-open). Only the failures above count;
+  4xx, 429 and a client that went away do not.
+- When `cheap` or `strong` fails (retries used up or breaker open), the request is served by the other one.
+  `X-Model-Used` and `X-Cost-USD` show the model that actually answered, and a fallback response is not cached.
+  Other model names are retried but have no fallback. If both fail the client gets 502 `upstream_error`.
+- For `cheap`/`strong` the response body's `model` is `cheap`/`strong` (the gateway's name, not the provider's).
+
+| Metric | Meaning |
+|---|---|
+| `provider_retries_total{model}` | retry attempts (not counting the first try) |
+| `provider_fallbacks_total{from,to}` | requests served by the other model |
+| `breaker_state{model}` | gauge: 0 closed, 1 open, 2 half-open |
+| `breaker_opens_total{model}` | times the breaker opened |
 
 The cache fails open: if Redis is slow or down, the request is served as a `MISS` from the provider and
 `llmgw_cache_errors_total{op="get"|"set"}` is incremented.

@@ -265,6 +265,90 @@ func TestUpstreamErrorsMapToStatus(t *testing.T) {
 	}
 }
 
+// downProvider answers 500 for the models in down and works for the rest.
+type downProvider struct {
+	down  map[string]bool
+	calls atomic.Int32
+}
+
+func (p *downProvider) Complete(_ context.Context, model string, _ *api.ChatRequest) (*api.ChatResponse, error) {
+	p.calls.Add(1)
+	if p.down[model] {
+		return nil, &provider.StatusError{Code: 500, Body: "down"}
+	}
+	return &api.ChatResponse{ID: "x", Model: "real-" + model, Usage: testUsage}, nil
+}
+
+func resilientFor(s *server, down ...string) *downProvider {
+	p := &downProvider{down: map[string]bool{}}
+	for _, m := range down {
+		p.down[m] = true
+	}
+	cfg := provider.DefaultResilientConfig()
+	cfg.BaseBackoff, cfg.MaxBackoff = time.Millisecond, time.Millisecond
+	s.provider = provider.NewResilient(p, cfg, s.metrics)
+	return p
+}
+
+func sendModel(s *server, model string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"`+model+`","messages":[{"role":"user","content":"hello"}]}`))
+	r.Header.Set("Authorization", "Bearer test-key")
+	w := httptest.NewRecorder()
+	s.handleChat(w, r)
+	return w
+}
+
+// strong is down: the request is served by cheap, reported and charged as
+// cheap, and not cached under strong's key (or at all).
+func TestFallbackReportsAndChargesActualModel(t *testing.T) {
+	s, _ := newTestServer(true)
+	p := resilientFor(s, "strong")
+	w := sendModel(s, "strong")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	if got := w.Header().Get(api.HeaderModel); got != "cheap" {
+		t.Errorf("X-Model-Used=%s, want cheap", got)
+	}
+	want := provider.Cost("cheap", testUsage)
+	if got := w.Header().Get(api.HeaderCostUSD); got != strconv.FormatFloat(want, 'f', 6, 64) {
+		t.Errorf("X-Cost-USD=%s, want %f (cheap price)", got, want)
+	}
+	if got := metric(t, s, `cost_usd_total{model="cheap"}`); got != want {
+		t.Errorf("cost_usd_total{cheap} = %v, want %v", got, want)
+	}
+	if got := metric(t, s, `cost_usd_total{model="strong"}`); got != 0 {
+		t.Errorf("cost_usd_total{strong} = %v, want 0", got)
+	}
+	if got := metric(t, s, `provider_fallbacks_total{from="strong",to="cheap"}`); got != 1 {
+		t.Errorf("fallbacks = %v, want 1", got)
+	}
+	msgs := []api.Message{{Role: "user", Content: "hello"}}
+	for _, m := range []string{"strong", "cheap"} {
+		if _, hit, _ := s.cache.Get(context.Background(), cache.Key(m, msgs)); hit {
+			t.Errorf("fallback response was cached under %s", m)
+		}
+	}
+	// strong is back: the same request must reach the provider, not a cache entry
+	p.down = nil
+	calls := p.calls.Load()
+	w = sendModel(s, "strong")
+	if w.Header().Get(api.HeaderCache) != "MISS" || w.Header().Get(api.HeaderModel) != "strong" || p.calls.Load() != calls+1 {
+		t.Errorf("after recovery: X-Cache=%s X-Model-Used=%s, want MISS strong from the provider",
+			w.Header().Get(api.HeaderCache), w.Header().Get(api.HeaderModel))
+	}
+}
+
+func TestBothModelsDownIs502(t *testing.T) {
+	s, _ := newTestServer(true)
+	resilientFor(s, "strong", "cheap")
+	w := sendModel(s, "strong")
+	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), `"upstream_error"`) {
+		t.Errorf("status %d %s, want 502 upstream_error", w.Code, w.Body.String())
+	}
+}
+
 func TestProviderCallTimesOut(t *testing.T) {
 	s, _ := newTestServer(false)
 	s.provider = slowProvider{}

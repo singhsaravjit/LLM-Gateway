@@ -83,7 +83,14 @@ func main() {
 	for m := range provider.Pricing { // so the dollars-saved panel starts at 0
 		reg.Inc(`cost_saved_usd_total{model="`+m+`"}`, 0)
 	}
-	prov := provider.NewHTTP(cfg.ProviderURL, cfg.ProviderAPIKey, cfg.ProviderTimeout)
+	// One Resilient client shared by the direct path and the queue workers, so
+	// both get retries, breakers and fallback.
+	prov := provider.NewResilient(provider.NewHTTP(cfg.ProviderURL, cfg.ProviderAPIKey, cfg.ProviderTimeout),
+		provider.ResilientConfig{MaxAttempts: cfg.RetryAttempts, BaseBackoff: cfg.RetryBase, MaxBackoff: cfg.RetryMax,
+			BreakerFailures: cfg.BreakerFailures, BreakerOpenFor: cfg.BreakerOpen, Fallback: cfg.FallbackEnabled}, reg)
+	log.Info("provider resilience", "attempts", cfg.RetryAttempts, "base_backoff", cfg.RetryBase.String(),
+		"max_backoff", cfg.RetryMax.String(), "breaker_failures", cfg.BreakerFailures,
+		"breaker_open", cfg.BreakerOpen.String(), "fallback", cfg.FallbackEnabled)
 	q, pacer, err := newQueue(log, rdb, prov, reg)
 	if err != nil {
 		log.Error("queue config", "err", err)
@@ -252,14 +259,30 @@ func (s *server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, status, "upstream_error", "provider request failed")
 		return
 	}
-	cost := provider.Cost(model, resp.Usage)
+	used := modelUsed(model, resp)
+	if used != model {
+		s.log.Info("served by fallback model", "request_id", reqID, "routed", model, "used", used)
+	}
+	cost := provider.Cost(used, resp.Usage)
 	s.recordSpend(ctx, reqID, team, cost)
-	if useCache {
+	// A fallback answer is not what the routed model would have said, so it
+	// must not be cached under that model's key.
+	if useCache && used == model {
 		if err := s.cache.Set(ctx, ckey, resp, s.cacheTTL); err != nil {
 			s.log.Warn("cache set error", "request_id", reqID, "err", err)
 		}
 	}
-	s.finish(w, reqID, key, team, model, cacheStatus, resp, cost, 0, start)
+	s.finish(w, reqID, key, team, used, cacheStatus, resp, cost, 0, start)
+}
+
+// modelUsed is the model that actually answered. After a fallback
+// provider.Resilient sets resp.Model to the other model of the cheap/strong
+// pair; this also works for queued requests since resp.Model is in the JSON.
+func modelUsed(routed string, resp *api.ChatResponse) string {
+	if other, ok := provider.FallbackModel(routed); ok && resp.Model == other {
+		return other
+	}
+	return routed
 }
 
 func (s *server) finish(w http.ResponseWriter, reqID, key, team, model, cacheStatus string, resp *api.ChatResponse, cost, saved float64, start time.Time) {
